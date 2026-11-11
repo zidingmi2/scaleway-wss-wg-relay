@@ -1,4 +1,11 @@
 /target
+**/target/
+/dist/
+/private/
+*.env
+*.conf
+*.oci.tar
+/verification-local/
 /benches/results/
 /.workstream-evidence/
 /*.yaml

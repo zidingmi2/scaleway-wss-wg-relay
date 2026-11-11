@@ -329,6 +329,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn ntp_rejects_active_retained_and_tun_only_synthetic_endpoints() {
         for endpoint in [
             "198.18.0.5:123",
@@ -367,7 +368,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(feature = "relay-minimal")))]
     #[test]
     fn managed_bootstrap_rejects_active_and_retained_fake_ranges() {
         use serde_json::json;
@@ -401,6 +402,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn automatic_probe_literals_reject_active_and_retained_custom_fake_ranges() {
         use serde_json::json;
 
@@ -461,6 +463,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn tun_endpoints_reject_every_active_pool_regardless_of_selected_context() {
         use serde_json::json;
 
@@ -506,6 +509,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn tun_reserved_endpoint_must_be_reserved_in_every_overlapping_pool() {
         for (wide, narrow, ip) in [
             ("198.18.0.0/28", "198.18.0.8/29", "198.18.0.9"),
@@ -530,6 +534,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn inline_policy_is_opt_in_private_and_defaults_to_system() {
         let configs = validate_yaml("- address: 127.0.0.1:1080\n  protocol: {type: socks}\n  dns: {fake_ip: true}\n- address: 127.0.0.1:1081\n  protocol: {type: socks}\n  dns: {fake_ip: true}\n").unwrap();
         assert_eq!(configs.dns_groups.len(), 2);
@@ -546,6 +551,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn private_identities_remain_group_references_with_url_like_paths_and_names() {
         let mut names = std::collections::HashSet::new();
         for fake_ip in [true, false] {
@@ -588,6 +594,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn private_socket_identities_preserve_non_utf8_path_bytes() {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
@@ -612,6 +619,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn group_reference_shares_but_override_derives() {
         let configs = validate_yaml("- dns_group: shared\n  dns_servers: system\n  fake_ip: true\n- address: 127.0.0.1:1080\n  protocol: {type: socks}\n  dns: {servers: shared}\n- address: 127.0.0.1:1081\n  protocol: {type: socks}\n  dns: {servers: shared, fake_ip: false}\n").unwrap();
         assert_eq!(configs.dns_groups.len(), 2);
@@ -678,6 +686,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn server_owned_destinations_reject_all_active_fake_ranges() {
         use serde_json::json;
         for address in [
@@ -728,6 +737,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn rule_overrides_reject_all_active_and_retained_fake_ranges() {
         use serde_json::json;
 

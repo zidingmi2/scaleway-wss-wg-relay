@@ -2,6 +2,206 @@ use super::*;
 use smoltcp::wire::TcpControl;
 
 #[test]
+fn bounded_tcp_egress_reserves_before_tokens_and_preserves_blocked_ingress() {
+    let (output, mut receiver) = mpsc::channel(1);
+    output
+        .try_send(PacketBuffer::copy_from_slice(b"occupied"))
+        .unwrap();
+    let mut device = QueueDevice {
+        packet: Some(PacketBuffer::copy_from_slice(b"pending ingress")),
+        output,
+        mtu: 1280,
+        drops: Arc::default(),
+    };
+    assert!(device.transmit(Instant::ZERO).is_none());
+    assert!(device.receive(Instant::ZERO).is_none());
+    assert_eq!(&**device.packet.as_ref().unwrap(), b"pending ingress");
+    assert_eq!(device.drops.load(Ordering::Relaxed), 0);
+    assert_eq!(&*receiver.try_recv().unwrap(), b"occupied");
+    let sender = device.output.clone();
+    let (rx, tx) = device.receive(Instant::ZERO).unwrap();
+    assert!(
+        sender
+            .try_send(PacketBuffer::copy_from_slice(b"racing send"))
+            .is_err()
+    );
+    rx.consume(|bytes| assert_eq!(bytes, b"pending ingress"));
+    tx.consume(5, |bytes| bytes.copy_from_slice(b"reply"));
+    assert_eq!(&*receiver.try_recv().unwrap(), b"reply");
+    assert!(device.packet.is_none());
+    assert_eq!(device.drops.load(Ordering::Relaxed), 0);
+    device
+        .transmit(Instant::ZERO)
+        .unwrap()
+        .consume(4, |bytes| bytes.copy_from_slice(b"next"));
+    assert_eq!(&*receiver.try_recv().unwrap(), b"next");
+}
+
+#[tokio::test]
+async fn releasing_output_capacity_and_closing_receiver_wake_the_stack() {
+    let (wake, mut wake_rx) = Wake::new().unwrap();
+    let (sender, inner) = mpsc::channel(1);
+    let mut receiver = OutputReceiver { inner, wake };
+    sender
+        .try_send(PacketBuffer::copy_from_slice(b"first"))
+        .unwrap();
+    assert!(!wake_rx.wait(-1, Some(Duration::ZERO)).unwrap());
+    assert_eq!(&*receiver.try_recv().unwrap(), b"first");
+    assert!(wake_rx.wait(-1, Some(Duration::ZERO)).unwrap());
+    wake_rx.drain().unwrap();
+    sender
+        .try_send(PacketBuffer::copy_from_slice(b"second"))
+        .unwrap();
+    assert_eq!(&*receiver.recv().await.unwrap(), b"second");
+    assert!(wake_rx.wait(-1, Some(Duration::ZERO)).unwrap());
+    wake_rx.drain().unwrap();
+    drop(receiver);
+    assert!(sender.is_closed());
+    assert!(wake_rx.wait(-1, Some(Duration::ZERO)).unwrap());
+}
+
+#[test]
+fn blocked_output_does_not_turn_pending_transmits_into_a_zero_delay_spin() {
+    assert_eq!(
+        output_backpressure_delay(true, Some(Duration::ZERO)),
+        Some(Duration::from_secs(1))
+    );
+    assert_eq!(
+        output_backpressure_delay(true, None),
+        Some(Duration::from_secs(1))
+    );
+    assert_eq!(
+        output_backpressure_delay(true, Some(Duration::from_secs(30))),
+        Some(Duration::from_secs(1))
+    );
+    assert_eq!(
+        output_backpressure_delay(true, Some(Duration::from_millis(5))),
+        Some(Duration::from_millis(5))
+    );
+    assert_eq!(
+        output_backpressure_delay(false, Some(Duration::ZERO)),
+        Some(Duration::ZERO)
+    );
+}
+
+#[test]
+fn fast_drained_receive_bursts_grow_the_window_without_high_queue_occupancy() {
+    use std::{
+        pin::Pin,
+        task::{Context, Waker},
+    };
+    use tokio::io::{AsyncRead, ReadBuf};
+
+    let limits = TunResourceLimits {
+        tcp_buffer_size: 32768,
+        tcp_buffer_max_size: Some(1 << 20),
+        tcp_memory_bytes: Some(32 << 20),
+        max_tcp_connections: Some(80),
+        ..Default::default()
+    };
+    let pool = TcpBufferPool::from_limits(&limits).unwrap();
+    let allocation = pool.admit().unwrap();
+    let (output, mut packets) = mpsc::channel(QUEUE_CAPACITY);
+    let mut device = QueueDevice {
+        packet: None,
+        output,
+        mtu: 1280,
+        drops: Arc::default(),
+    };
+    let start = Instant::from_secs(1);
+    let mut iface = Interface::new(Config::new(HardwareAddress::Ip), &mut device, start);
+    let source: SocketAddr = "10.77.0.2:40000".parse().unwrap();
+    let target: SocketAddr = "10.77.0.1:443".parse().unwrap();
+    iface.update_ip_addrs(|ips| ips.push(IpCidr::new(target.ip().into(), 24)).unwrap());
+    let mut socket = tcp_socket(32768);
+    socket.set_recv_max_capacity(allocation.maximum()).unwrap();
+    socket.listen(target).unwrap();
+    let mut sockets = SocketSet::new(vec![]);
+    let handle = sockets.add(socket);
+    let control = Arc::new(
+        TcpConnectionControl::new(32768, 32768).with_buffer_allocation(allocation.clone()),
+    );
+    let (wake, _wake_rx) = Wake::new().unwrap();
+    let mut connection = TcpConnection::new(control.clone(), wake);
+    let mut entry = TcpEntry {
+        control: control.clone(),
+        buffers: Some(allocation),
+        remote: source,
+        local: target,
+        outbound: false,
+        established: false,
+        pending_connect: None,
+        pending_accept: None,
+    };
+    let mut syn = etherparse::TcpHeader::new(source.port(), target.port(), 1000, 65535);
+    syn.syn = true;
+    syn.set_options(&[etherparse::TcpOptionElement::WindowScale(0)])
+        .unwrap();
+    let syn = etherparse::PacketBuilder::ipv4([10, 77, 0, 2], [10, 77, 0, 1], 64).tcp_header(syn);
+    let mut syn_packet = PacketBuffer::with_capacity(syn.size(0));
+    syn_packet.resize(syn.size(0));
+    syn.write(&mut &mut syn_packet[..], &[]).unwrap();
+    device.packet = Some(syn_packet);
+    iface.poll(start, &mut device, &mut sockets);
+    let synack = packets.try_recv().unwrap();
+    let info = packet_info(&synack).unwrap();
+    let ack = (TcpPacket::new_checked(&synack[info.transport_offset..])
+        .unwrap()
+        .seq_number()
+        + 1)
+    .0 as u32;
+    device.packet = Some(tcp_segment(
+        source,
+        target,
+        1001,
+        TcpControl::None,
+        Some(ack),
+    ));
+    iface.poll(start, &mut device, &mut sockets);
+    entry.pump(handle, sockets.get_mut::<TcpSocket>(handle), start);
+    while packets.try_recv().is_ok() {}
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut greatest_window = 0usize;
+    for index in 0..96u32 {
+        let payload = [index as u8; 1024];
+        device.packet = Some(tcp_segment_with_data(
+            source,
+            target,
+            1001 + index * 1024,
+            TcpControl::None,
+            Some(ack),
+            &payload,
+        ));
+        iface.poll_ingress_single(start, &mut device, &mut sockets);
+        let socket = sockets.get_mut::<TcpSocket>(handle);
+        // No burst or bridge queue ever reaches even the initial 75% threshold.
+        assert!(socket.recv_queue() < 32768 * 3 / 4);
+        assert_eq!(control.buffer_usage().0, 0);
+        entry.pump(handle, socket, start);
+        let mut received = [0; 1024];
+        let mut read = ReadBuf::new(&mut received);
+        assert!(
+            Pin::new(&mut connection)
+                .poll_read(&mut cx, &mut read)
+                .is_ready()
+        );
+        assert_eq!(read.filled(), &payload);
+        iface.poll_egress(start, &mut device, &mut sockets);
+        while let Ok(packet) = packets.try_recv() {
+            let info = packet_info(&packet).unwrap();
+            let tcp = TcpPacket::new_checked(&packet[info.transport_offset..]).unwrap();
+            // Maximum 1 MiB negotiated shift=5; actual window tracks allocation.
+            greatest_window = greatest_window.max(tcp.window_len() as usize * 32);
+        }
+    }
+    assert_eq!(control.receive_progress(), 96 * 1024);
+    assert_eq!(sockets.get::<TcpSocket>(handle).recv_capacity(), 128 * 1024);
+    assert!(greatest_window >= 128 * 1024);
+    assert_eq!(control.buffer_usage().0, 0);
+    assert_eq!(device.drops.load(Ordering::Relaxed), 0);
+}
+
+#[test]
 fn local_allocation_preserves_family_order_wraps_and_skips_both_flow_types() {
     let ipv4 = "10.77.0.1".parse().unwrap();
     let ipv6 = "fd77::1".parse().unwrap();
@@ -12,6 +212,7 @@ fn local_allocation_preserves_family_order_wraps_and_skips_both_flow_types() {
         sockets.add(tcp_socket(4096)),
         TcpEntry {
             control: Arc::new(TcpConnectionControl::new(4096, 4096)),
+            buffers: None,
             remote: target,
             local: SocketAddr::new(ipv4, LAST_EPHEMERAL_PORT),
             outbound: true,
@@ -570,6 +771,7 @@ fn orphaned_fin_wait_releases_admission_even_when_peer_keeps_sending_acks() {
             handle,
             TcpEntry {
                 control: control.clone(),
+                buffers: None,
                 remote: source,
                 local: target,
                 outbound: false,
@@ -785,6 +987,7 @@ fn inbound_handshake_timeout_is_lifted_only_after_establishment() {
         let (accepted, mut accepted_rx) = mpsc::channel(1);
         let mut entry = TcpEntry {
             control: control.clone(),
+            buffers: None,
             remote: source,
             local: target,
             outbound: false,
@@ -1212,4 +1415,52 @@ fn classification_rejects_fragments_extensions_and_bad_checksums() {
     assert!(packet_info(&bytes).is_some());
     bytes[6] = 44;
     assert!(packet_info(&bytes).is_none());
+}
+
+#[test]
+fn fragmented_udp_output_admission_is_atomic_and_keeps_byte_leases() {
+    let (output, mut receiver) = mpsc::channel(QUEUE_CAPACITY);
+    let drops = Arc::new(AtomicU64::new(0));
+    let device = QueueDevice {
+        packet: None,
+        output,
+        mtu: 1280,
+        drops: drops.clone(),
+    };
+    let budget = Arc::new(Budget::new(Some(8 * 1024 * 1024)));
+    let make = || {
+        crate::tun::udp_handler::build_udp_packet(
+            &vec![0x2a; 65507],
+            "10.77.0.1:1".parse().unwrap(),
+            "10.77.0.2:2".parse().unwrap(),
+        )
+        .unwrap()
+    };
+    for _ in 0..20 {
+        device
+            .output
+            .try_send(PacketBuffer::copy_from_slice(b"occupied"))
+            .unwrap();
+    }
+    device.emit_udp(make(), &budget);
+    assert_eq!(drops.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        receiver.len(),
+        20,
+        "no prefix of a rejected fragment batch may escape"
+    );
+    assert_eq!(budget.snapshot().active, 0);
+    while receiver.try_recv().is_ok() {}
+    device.emit_udp(make(), &budget);
+    assert_eq!(receiver.len(), 53);
+    assert!(
+        budget.snapshot().active > 65535,
+        "output queue retains the reserved split peak"
+    );
+    for _ in 0..52 {
+        drop(receiver.try_recv().unwrap());
+    }
+    assert!(budget.snapshot().active > 0);
+    drop(receiver.try_recv().unwrap());
+    assert_eq!(budget.snapshot().active, 0);
 }

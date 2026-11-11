@@ -50,9 +50,11 @@ impl Default for HickoryResolverOptions {
 /// Resolver implementation using hickory-dns.
 /// Uses ProxyRuntimeProvider for all connections (both direct and proxied).
 pub struct HickoryResolver {
-    inner: Resolver<ProxyRuntimeProvider>,
+    inner: Option<Resolver<ProxyRuntimeProvider>>,
     exchange: Arc<super::exchange::RawDnsExchange>,
     description: String,
+    bounded_ipv4: bool,
+    lookup_timeout: Duration,
 }
 
 impl Debug for HickoryResolver {
@@ -65,7 +67,7 @@ impl Debug for HickoryResolver {
 
 impl HickoryResolver {
     /// Create a UDP DNS resolver.
-    /// Note: UDP uses the chain_group but only works with direct chains.
+    /// UDP uses the configured native or tunneled datagram chain.
     pub fn udp(
         addr: SocketAddr,
         chain_group: Arc<ClientChainGroup>,
@@ -153,23 +155,34 @@ impl HickoryResolver {
         bootstrap: Arc<dyn ShoesResolver>,
         options: HickoryResolverOptions,
     ) -> std::io::Result<Self> {
-        // Cloudflare has a broken GREASE implementation.
-        // See: https://github.com/hyperium/h3/issues/206
-        let protocol = ProtocolConfig::H3 {
-            server_name: server_name.clone(),
-            path,
-            disable_grease: true,
-        };
-        let mut conn_config = ConnectionConfig::new(protocol);
-        conn_config.port = addr.port();
-        Self::build(
-            addr.ip(),
-            conn_config,
-            chain_group,
-            bootstrap,
-            options,
-            format!("h3://{}", server_name),
-        )
+        #[cfg(feature = "relay-minimal")]
+        {
+            let _ = (addr, server_name, path, chain_group, bootstrap, options);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "H3 DNS is not included in relay-minimal",
+            ));
+        }
+        #[cfg(not(feature = "relay-minimal"))]
+        {
+            // Cloudflare has a broken GREASE implementation.
+            // See: https://github.com/hyperium/h3/issues/206
+            let protocol = ProtocolConfig::H3 {
+                server_name: server_name.clone(),
+                path,
+                disable_grease: true,
+            };
+            let mut conn_config = ConnectionConfig::new(protocol);
+            conn_config.port = addr.port();
+            Self::build(
+                addr.ip(),
+                conn_config,
+                chain_group,
+                bootstrap,
+                options,
+                format!("h3://{}", server_name),
+            )
+        }
     }
 
     /// Create a resolver with multiple nameservers in a single hickory pool.
@@ -184,7 +197,7 @@ impl HickoryResolver {
     ) -> std::io::Result<Self> {
         let ns_configs: Vec<NameServerConfig> = servers
             .into_iter()
-            .map(|(ip, conn_config)| NameServerConfig::new(ip, true, vec![conn_config]))
+            .map(|(ip, conn_config)| NameServerConfig::new(ip, true, connections(conn_config)))
             .collect();
 
         Self::build_with_ns_configs(ns_configs, chain_group, bootstrap, options, description)
@@ -198,7 +211,7 @@ impl HickoryResolver {
         options: HickoryResolverOptions,
         description: String,
     ) -> std::io::Result<Self> {
-        let ns_config = NameServerConfig::new(ip, true, vec![conn_config]);
+        let ns_config = NameServerConfig::new(ip, true, connections(conn_config));
         Self::build_with_ns_configs(
             vec![ns_config],
             chain_group,
@@ -233,23 +246,54 @@ impl HickoryResolver {
             resolver_opts.timeout = timeout;
         }
         resolver_opts.attempts = options.attempts;
+        // The relay's A-only path shares one byte-accounted wire cache with raw
+        // exchanges; disable Hickory's additional response-count-only cache.
+        let bounded_ipv4 =
+            cfg!(feature = "relay-minimal") && options.ip_strategy == IpStrategy::Ipv4Only;
+        resolver_opts.cache_size = if bounded_ipv4 { 0 } else { 1024 };
+        resolver_opts.num_concurrent_reqs = ns_configs.len().clamp(1, 2);
         let exchange = Arc::new(super::exchange::RawDnsExchange::new(
             ns_configs,
             provider,
             resolver_opts.clone(),
         ));
-        let builder =
-            builder.with_tls_config(crate::rustls_config_util::create_dns_client_config());
-        let resolver = builder
-            .build()
-            .map_err(|e| std::io::Error::other(format!("failed to build resolver: {e}")))?;
+        let resolver = if bounded_ipv4 {
+            // Do not allocate a second nameserver pool, moka cache or system
+            // hosts table when all lookups use the bounded raw exchange path.
+            None
+        } else {
+            Some(
+                builder
+                    .with_tls_config(crate::rustls_config_util::create_dns_client_config())
+                    .build()
+                    .map_err(|e| std::io::Error::other(format!("failed to build resolver: {e}")))?,
+            )
+        };
 
         Ok(Self {
             inner: resolver,
             exchange,
             description,
+            bounded_ipv4,
+            lookup_timeout: options
+                .request_timeout
+                .unwrap_or(Duration::from_secs(10))
+                .saturating_mul(options.attempts.max(1).min(u32::MAX as usize) as u32),
         })
     }
+}
+
+fn connections(config: ConnectionConfig) -> Vec<ConnectionConfig> {
+    #[cfg(feature = "relay-minimal")]
+    if matches!(config.protocol, ProtocolConfig::Udp) {
+        // A truncated UDP answer may only retry this same resolver through the
+        // same WG route. There is no implicit system DNS or direct TCP path.
+        let mut tcp = ConnectionConfig::tcp();
+        tcp.port = config.port;
+        tcp.bind_addr = config.bind_addr;
+        return vec![config, tcp];
+    }
+    vec![config]
 }
 
 impl ShoesResolver for HickoryResolver {
@@ -279,8 +323,17 @@ impl ShoesResolver for HickoryResolver {
 
         let name = location.address().to_string();
         let port = location.port();
+        if self.bounded_ipv4 {
+            let exchange = self.exchange.clone();
+            let deadline = tokio::time::Instant::now() + self.lookup_timeout;
+            return Box::pin(async move { lookup_ipv4(exchange, name, port, deadline).await });
+        }
         let description = self.description.clone();
-        let resolver = self.inner.clone();
+        let resolver = self
+            .inner
+            .as_ref()
+            .expect("non-bounded resolver has lookup pool")
+            .clone();
 
         Box::pin(async move {
             let started = std::time::Instant::now();
@@ -335,6 +388,102 @@ impl ShoesResolver for HickoryResolver {
     }
 }
 
+/// Follow at most eight CNAME edges using the same bounded response cache and
+/// deadline. Only A records at the queried name or its authenticated CNAME
+/// targets are returned; unrelated additional records cannot redirect traffic.
+async fn lookup_ipv4(
+    exchange: Arc<super::exchange::RawDnsExchange>,
+    hostname: String,
+    port: u16,
+    deadline: tokio::time::Instant,
+) -> std::io::Result<Vec<SocketAddr>> {
+    use hickory_resolver::proto::{
+        op::{Edns, Message, Query, ResponseCode},
+        rr::{Name, RData, RecordType},
+    };
+    let mut name = Name::from_utf8(&hostname).map_err(std::io::Error::other)?;
+    name.set_fqdn(true);
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(name.clone());
+    let mut edges = 0;
+    loop {
+        let mut request = Message::query();
+        request.metadata.recursion_desired = true;
+        let mut edns = Edns::new();
+        edns.set_max_payload(super::message::UDP_PAYLOAD_LIMIT);
+        request.edns = Some(edns);
+        request.add_query(Query::query(name.clone(), RecordType::A));
+        let bytes = exchange
+            .exchange_with_deadline(request.to_vec().map_err(std::io::Error::other)?, deadline)
+            .await?;
+        let answer = super::message::decode(&bytes)?;
+        if answer.metadata.response_code != ResponseCode::NoError {
+            return Err(super::exchange::net_error(
+                hickory_resolver::net::NoRecords::new(
+                    answer.queries[0].clone(),
+                    answer.metadata.response_code,
+                )
+                .into(),
+            ));
+        }
+        if answer.metadata.truncation {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "truncated DNS address response",
+            ));
+        }
+        loop {
+            let addresses: Vec<_> = answer
+                .answers
+                .iter()
+                .filter_map(|record| {
+                    if record.name != name {
+                        return None;
+                    }
+                    match record.data {
+                        RData::A(address) if !address.0.is_unspecified() => {
+                            Some(SocketAddr::new(address.0.into(), port))
+                        }
+                        _ => None,
+                    }
+                })
+                .collect();
+            if !addresses.is_empty() {
+                return Ok(addresses);
+            }
+            let alias = answer.answers.iter().find_map(|record| {
+                if record.name != name {
+                    return None;
+                }
+                match &record.data {
+                    RData::CNAME(alias) => Some(alias.0.clone()),
+                    _ => None,
+                }
+            });
+            let Some(alias) = alias else {
+                return Err(super::exchange::net_error(
+                    hickory_resolver::net::NoRecords::new(
+                        answer.queries[0].clone(),
+                        ResponseCode::NoError,
+                    )
+                    .into(),
+                ));
+            };
+            edges += 1;
+            if edges > 8 || !seen.insert(alias.clone()) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "DNS CNAME loop or depth exceeded",
+                ));
+            }
+            name = alias;
+            if !answer.answers.iter().any(|record| record.name == name) {
+                break;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,7 +532,9 @@ mod tests {
                 )
                 .unwrap()
             });
-            assert_eq!(resolver.inner.options().max_active_requests, 32);
+            if let Some(inner) = &resolver.inner {
+                assert_eq!(inner.options().max_active_requests, 32);
+            }
             let (stop, stopped) = tokio::sync::oneshot::channel();
             let server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
                 let (tcp, _) = listener.accept().await.unwrap();

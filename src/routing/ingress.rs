@@ -239,5 +239,5 @@ fn reply_destination(wire_destination: NetLocation, require_ip_reply: bool) -> N
     wire_destination
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "relay-minimal")))]
 pub(crate) mod tests;

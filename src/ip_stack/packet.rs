@@ -1,11 +1,16 @@
 use std::{
     mem,
     ops::{Deref, DerefMut, Range},
-    sync::{LazyLock, Mutex},
+    sync::{Arc, LazyLock, Mutex},
 };
 
 const BUFFER_POOL_MAX_SIZE: usize = 64;
+// The relay only needs MTU-sized reusable packet storage. Do not retain a pool
+// of jumbo UDP allocations after a short burst (64 * 65 KiB in the full build).
+#[cfg(feature = "relay-minimal")]
+const BUFFER_POOL_MAX_CAPACITY: usize = 4096;
 // Leaves room for TUN framing and offload headers alongside the IP packet.
+#[cfg(not(feature = "relay-minimal"))]
 const BUFFER_POOL_MAX_CAPACITY: usize = 65_535 + 16;
 static BUFFER_POOL: LazyLock<Mutex<Vec<Vec<u8>>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
@@ -15,6 +20,9 @@ pub struct PacketBuffer {
     storage: Vec<u8>,
     range: Range<usize>,
     pooled: bool,
+    // A fragment batch shares its reservation until its last packet leaves the
+    // output queue. Dropping the per-flow queue must not release these credits.
+    lease: Option<Arc<Vec<crate::resources::BudgetPermit>>>,
 }
 
 impl PacketBuffer {
@@ -29,6 +37,7 @@ impl PacketBuffer {
             storage,
             range: 0..0,
             pooled: true,
+            lease: None,
         }
     }
 
@@ -37,7 +46,31 @@ impl PacketBuffer {
             storage: data.to_vec(),
             range: 0..data.len(),
             pooled: false,
+            lease: None,
         }
+    }
+
+    pub(crate) fn from_vec(storage: Vec<u8>) -> Self {
+        let len = storage.len();
+        Self {
+            storage,
+            range: 0..len,
+            pooled: false,
+            lease: None,
+        }
+    }
+
+    pub(crate) fn with_lease(mut self, lease: Arc<Vec<crate::resources::BudgetPermit>>) -> Self {
+        self.lease = Some(lease);
+        self
+    }
+
+    pub(crate) fn lease(&self) -> Option<Arc<Vec<crate::resources::BudgetPermit>>> {
+        self.lease.clone()
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.storage.capacity()
     }
 
     pub fn resize(&mut self, length: usize) {
@@ -55,12 +88,14 @@ impl PacketBuffer {
         self.range = self.range.start + range.start..self.range.start + range.end;
     }
 
-    pub fn into_payload(self, compact: bool) -> Self {
+    pub fn into_payload(mut self, compact: bool) -> Self {
         let capacity = self.storage.capacity();
         let payload_len = self.len();
         // Tiny datagrams must not pin jumbo/MTU storage in per-flow queues.
         if (compact && capacity != payload_len) || capacity > payload_len.saturating_mul(2) {
-            Self::copy_from_slice(&self)
+            let mut result = Self::copy_from_slice(&self);
+            result.lease = self.lease.take();
+            result
         } else {
             self
         }

@@ -50,12 +50,23 @@ pub(crate) fn validate(hops: &OneOrSome<ClientChainHop>) -> io::Result<()> {
 
 pub(super) fn validate_position(client: &ClientConfig, offset: usize) -> io::Result<()> {
     client.validate_quic_key_exchange(offset == 0)?;
-    crate::quic_client::validate_resolved(client, offset == 0)?;
+    #[cfg(not(feature = "relay-minimal"))]
+    let xhttp_h3 = {
+        crate::quic_client::validate_resolved(client, offset == 0)?;
+        client.transport == super::Transport::Quic
+            && crate::xhttp::connector::contains(&client.protocol)
+    };
+    #[cfg(feature = "relay-minimal")]
+    let xhttp_h3 = {
+        if client.transport == super::Transport::Quic {
+            return Err(invalid("QUIC transport is not included in relay-minimal"));
+        }
+        false
+    };
     validate_position_flags(
         client.protocol.is_direct(),
         client.protocol.is_wireguard(),
-        client.transport == super::Transport::Quic
-            && crate::xhttp::connector::contains(&client.protocol),
+        xhttp_h3,
         offset,
     )
 }
@@ -140,6 +151,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn group_wrappers_are_alternatives_and_bare_lists_are_sequences() {
         let base = json!([
             {"client_group":"a", "client_chains":[proxy("a-leaf")]},
@@ -174,6 +186,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn named_groups_compose_different_length_paths_without_crossing_branches() {
         let validated = validate(json!([
             {"client_group":"a1-selected","type":"selector","client_chains":[proxy("a1")]},
@@ -207,6 +220,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn group_pool_stages_are_available_to_forwarding_and_probe_routes() {
         for field in ["client_chain", "client_chains"] {
             let validated = validate(json!([
@@ -247,6 +261,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn group_origins_do_not_enter_wireguard_carriers_or_include_builtin_direct() {
         let mut wireguard = crate::wireguard::test_support::client(51820);
         wireguard["client_chains"][0]["name"] = json!("tunnel");
@@ -281,6 +296,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn group_chain_wrappers_are_strict_and_selector_labels_are_explicit() {
         for members in [
             json!([]),
@@ -324,6 +340,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn unused_groups_and_nested_choices_obey_physical_hop_restrictions() {
         for members in [
             json!([{"chain":[proxy("first"),"direct"]}]),
@@ -340,6 +357,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn physical_hop_limit_counts_sequences_and_the_longest_alternative() {
         let hops = |name: &str, length: usize| {
             (0..length)
@@ -428,6 +446,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn expansion_budget_includes_nested_wireguard_carriers() {
         let mut groups = vec![json!({"client_group":"g0","client_chains":["direct"]})];
         for index in 1..20 {
@@ -443,6 +462,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn fixed_aliases_have_the_same_depth_in_forwarding_and_probe_routes() {
         for explicit_chain in [false, true] {
             let mut groups =
@@ -464,6 +484,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn probe_node_budget_counts_normalized_routes_not_fixed_alias_visits() {
         let mut groups = vec![json!({"client_group":"g0","client_chains":[proxy("leaf")]})];
         for index in 1..=16 {
@@ -487,6 +508,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn repeated_url_test_references_validate_within_the_node_budget() {
         let members = vec![json!({"chain":["auto"]}); 2048];
         validate(json!([

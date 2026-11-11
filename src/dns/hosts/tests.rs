@@ -403,6 +403,7 @@ async fn hosts_survive_backend_refresh_without_using_it() {
 }
 
 #[tokio::test]
+#[cfg(not(feature = "relay-minimal"))]
 async fn hosts_only_inline_and_default_maps_share_native_fallback_without_leaking() {
     use crate::config::{ResolvedConfig, create_server_configs};
 
@@ -453,6 +454,7 @@ async fn hosts_only_inline_and_default_maps_share_native_fallback_without_leakin
 }
 
 #[tokio::test]
+#[cfg(not(feature = "relay-minimal"))]
 async fn hosts_registry_covers_native_pooled_mixed_and_fake_resolvers() {
     let trap = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
     let endpoint = format!("udp://127.0.0.1:{}", trap.local_addr().unwrap().port());
@@ -530,6 +532,7 @@ async fn hosts_registry_covers_native_pooled_mixed_and_fake_resolvers() {
 }
 
 #[tokio::test]
+#[cfg(not(feature = "relay-minimal"))]
 async fn hosts_bootstrap_and_reload_remain_scoped() {
     use crate::dns::build_dns_registry_reusing;
     let config = |ip: &str| {
@@ -608,6 +611,7 @@ async fn hosts_bootstrap_and_reload_remain_scoped() {
 }
 
 #[tokio::test]
+#[cfg(not(feature = "relay-minimal"))]
 async fn hosts_static_answers_obey_tcp_framing_udp_limits_and_prechecks() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let ips: Vec<_> = (1..=100).map(|last| format!("192.0.2.{last}")).collect();

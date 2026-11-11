@@ -17,6 +17,7 @@ fn dns(config: &ResolvedConfig) -> Option<&ResolvedDnsConfig> {
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn default_dns_is_order_independent_and_explicit_objects_override_it() {
     let mut null_dns = listener(1081);
     null_dns["dns"] = Value::Null;
@@ -65,6 +66,7 @@ fn default_dns_is_order_independent_and_explicit_objects_override_it() {
 }
 
 #[tokio::test]
+#[cfg(not(feature = "relay-minimal"))]
 async fn default_dns_inline_fake_pool_is_shared_and_system_never_inherits_itself() {
     for servers in [None, Some("udp://127.0.0.1:9")] {
         let mut default = json!({"fake_ip": {"max_entries": 16}});
@@ -141,6 +143,7 @@ fn default_dns_validates_even_when_no_listener_uses_it() {
 
 #[cfg(unix)]
 #[tokio::test]
+#[cfg(not(feature = "relay-minimal"))]
 async fn default_dns_reserves_raw_bootstrap_ranges_and_state_paths() {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state.json");
@@ -172,6 +175,7 @@ async fn default_dns_reserves_raw_bootstrap_ranges_and_state_paths() {
 }
 
 #[tokio::test]
+#[cfg(not(feature = "relay-minimal"))]
 async fn default_dns_clients_participate_in_pem_loading_and_client_visits() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("client.pem");

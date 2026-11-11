@@ -294,5 +294,5 @@ impl Worker {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "relay-minimal")))]
 mod tests;

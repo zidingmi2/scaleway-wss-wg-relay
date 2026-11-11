@@ -70,7 +70,7 @@ fn has_token(headers: &HashMap<String, String>, name: &str, token: &str) -> bool
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "relay-minimal")))]
 mod request_tests {
     use super::*;
     use crate::async_stream::test_streams::FlushGatedStream;
@@ -738,6 +738,6 @@ fn create_websocket_key_response(key: String) -> String {
     BASE64.encode(hash.as_ref())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "relay-minimal")))]
 #[path = "early_tests.rs"]
 mod early_tests;

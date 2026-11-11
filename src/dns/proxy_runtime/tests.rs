@@ -7,6 +7,7 @@ use crate::tcp::socket_connector::SocketConnector;
 use async_trait::async_trait;
 
 #[tokio::test]
+#[cfg(not(feature = "relay-minimal"))]
 async fn downstream_dns_proxy_names_remain_remote_for_forwarding() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -120,6 +121,200 @@ fn test_provider_is_clone() {
     let _cloned = provider.clone();
 }
 
+#[derive(Debug, Default)]
+struct DatagramFixture {
+    opened: parking_lot::Mutex<Vec<SocketAddr>>,
+    sent: parking_lot::Mutex<Vec<Vec<u8>>>,
+    incoming: parking_lot::Mutex<std::collections::VecDeque<Vec<u8>>>,
+    flush_ready: std::sync::atomic::AtomicBool,
+    fail: bool,
+    hang: bool,
+}
+
+#[derive(Debug)]
+struct FakeTunnelConnector(Arc<DatagramFixture>);
+
+#[async_trait]
+impl SocketConnector for FakeTunnelConnector {
+    async fn connect(
+        &self,
+        _: &Arc<dyn Resolver>,
+        _: &crate::address::ResolvedLocation,
+    ) -> io::Result<Box<dyn AsyncStream>> {
+        panic!("UDP DNS must not open TCP or a native DNS fallback")
+    }
+    async fn connect_udp_bidirectional(
+        &self,
+        _: &Arc<dyn Resolver>,
+        target: crate::address::ResolvedLocation,
+    ) -> io::Result<Box<dyn AsyncMessageStream>> {
+        self.0
+            .opened
+            .lock()
+            .push(target.location().to_socket_addr_nonblocking().unwrap());
+        if self.0.hang {
+            std::future::pending::<()>().await;
+        }
+        if self.0.fail {
+            return Err(io::ErrorKind::ConnectionRefused.into());
+        }
+        Ok(Box::new(FakeDatagramStream(self.0.clone())))
+    }
+    fn bind_interface(&self) -> Option<&str> {
+        None
+    }
+}
+
+struct FakeDatagramStream(Arc<DatagramFixture>);
+
+impl crate::async_stream::AsyncReadMessage for FakeDatagramStream {
+    fn read_message_eof_on_empty(&self) -> bool {
+        false
+    }
+    fn poll_read_message(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if let Some(bytes) = self.0.incoming.lock().pop_front() {
+            if bytes.len() > buf.remaining() {
+                return Poll::Ready(Err(io::ErrorKind::InvalidInput.into()));
+            }
+            buf.put_slice(&bytes);
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
+        }
+    }
+}
+impl crate::async_stream::AsyncWriteMessage for FakeDatagramStream {
+    fn poll_write_message(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        bytes: &[u8],
+    ) -> Poll<io::Result<()>> {
+        self.0.sent.lock().push(bytes.to_vec());
+        Poll::Ready(Ok(()))
+    }
+}
+impl crate::async_stream::AsyncFlushMessage for FakeDatagramStream {
+    fn poll_flush_message(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self
+            .0
+            .flush_ready
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
+        }
+    }
+}
+impl crate::async_stream::AsyncShutdownMessage for FakeDatagramStream {
+    fn poll_shutdown_message(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+impl crate::async_stream::AsyncPing for FakeDatagramStream {
+    fn supports_ping(&self) -> bool {
+        false
+    }
+    fn poll_write_ping(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<bool>> {
+        Poll::Ready(Ok(false))
+    }
+}
+impl AsyncMessageStream for FakeDatagramStream {}
+
+fn fake_tunnel_provider(fixture: Arc<DatagramFixture>) -> ProxyRuntimeProvider {
+    let chains = ClientChainGroup::new(vec![ClientProxyChain::new(
+        vec![InitialHopEntry::Wireguard(Arc::new(FakeTunnelConnector(
+            fixture,
+        )))],
+        vec![],
+    )]);
+    ProxyRuntimeProvider::with_bootstrap(
+        Arc::new(chains),
+        Arc::new(NativeResolver::new()),
+        TEST_CONNECT_TIMEOUT,
+    )
+}
+
+#[tokio::test]
+async fn udp_dns_tunnel_preserves_datagrams_and_pins_upstream() {
+    let fixture = Arc::new(DatagramFixture::default());
+    let provider = fake_tunnel_provider(fixture.clone());
+    let upstream: SocketAddr = "192.0.2.53:53".parse().unwrap();
+    let socket = provider
+        .bind_udp("0.0.0.0:0".parse().unwrap(), upstream)
+        .await
+        .unwrap();
+    assert_eq!(*fixture.opened.lock(), [upstream]);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    assert!(
+        socket
+            .poll_send_to(&mut cx, b"query", upstream)
+            .is_pending()
+    );
+    assert!(
+        socket
+            .poll_send_to(&mut cx, b"query", upstream)
+            .is_pending()
+    );
+    assert_eq!(
+        fixture.sent.lock().len(),
+        1,
+        "Pending flush must not duplicate a DNS query"
+    );
+    fixture
+        .flush_ready
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(matches!(
+        socket.poll_send_to(&mut cx, b"query", upstream),
+        Poll::Ready(Ok(5))
+    ));
+    assert!(matches!(
+        socket.poll_send_to(&mut cx, b"query", "192.0.2.54:53".parse().unwrap()),
+        Poll::Ready(Err(_))
+    ));
+    fixture.incoming.lock().push_back(b"answer".to_vec());
+    let mut bytes = [0; 32];
+    assert!(
+        matches!(socket.poll_recv_from(&mut cx, &mut bytes), Poll::Ready(Ok((6, peer))) if peer == upstream)
+    );
+    assert_eq!(&bytes[..6], b"answer");
+}
+
+#[tokio::test(start_paused = true)]
+async fn udp_dns_tunnel_setup_failure_never_falls_back_to_native_socket() {
+    for hang in [false, true] {
+        let fixture = Arc::new(DatagramFixture {
+            fail: !hang,
+            hang,
+            ..Default::default()
+        });
+        let provider = fake_tunnel_provider(fixture.clone());
+        let result = provider
+            .bind_udp(
+                "0.0.0.0:0".parse().unwrap(),
+                "192.0.2.53:53".parse().unwrap(),
+            )
+            .await;
+        let error = match result {
+            Ok(_) => panic!("failed tunnel must not become direct UDP"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.kind(),
+            if hang {
+                io::ErrorKind::TimedOut
+            } else {
+                io::ErrorKind::ConnectionRefused
+            }
+        );
+        assert_eq!(fixture.opened.lock().len(), 1);
+    }
+}
+
 #[test]
 fn test_spawn_handle_is_clone() {
     let handle = TokioSpawnHandle;
@@ -145,7 +340,7 @@ async fn test_bind_udp_works_directly() {
     );
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(feature = "relay-minimal")))]
 #[tokio::test]
 async fn new_dns_sockets_follow_direct_selector_changes() {
     let config = r#"
@@ -239,6 +434,7 @@ fn test_create_handle() {
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn test_quic_binder_available() {
     let resolver = Arc::new(NativeResolver::new());
     let chain_group = Arc::new(build_direct_chain_group(resolver.clone()));
@@ -247,6 +443,7 @@ fn test_quic_binder_available() {
     assert!(provider.quic_binder().is_some());
 }
 
+#[cfg(not(feature = "relay-minimal"))]
 fn run_quic_test_in_child(name: &str) -> bool {
     if std::env::var("SHOES_DNS_QUIC_TEST_CHILD").as_deref() == Ok(name) {
         crate::resources::configure(crate::config::GlobalLimits {
@@ -265,6 +462,7 @@ fn run_quic_test_in_child(name: &str) -> bool {
 }
 
 #[tokio::test]
+#[cfg(not(feature = "relay-minimal"))]
 async fn quic_binder_keeps_candidate_reservation_without_publishing_limits() {
     if run_quic_test_in_child("quic_binder_keeps_candidate_reservation_without_publishing_limits") {
         return;
@@ -328,6 +526,7 @@ async fn quic_binder_keeps_candidate_reservation_without_publishing_limits() {
 }
 
 #[tokio::test]
+#[cfg(not(feature = "relay-minimal"))]
 async fn quic_binder_reserves_shared_memory_until_last_socket_drop() {
     if run_quic_test_in_child("quic_binder_reserves_shared_memory_until_last_socket_drop") {
         return;
@@ -375,6 +574,7 @@ async fn quic_binder_reserves_shared_memory_until_last_socket_drop() {
 }
 
 #[tokio::test]
+#[cfg(not(feature = "relay-minimal"))]
 async fn h3_lookup_uses_budgeted_socket_and_releases_it_on_teardown() {
     use bytes::Buf;
     use hickory_resolver::config::{

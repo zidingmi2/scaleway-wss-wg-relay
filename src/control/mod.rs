@@ -3,12 +3,17 @@ pub mod connection_notes;
 #[cfg(all(test, debug_assertions))]
 pub(crate) mod connection_notes_allocation_tests;
 pub mod flows;
+#[cfg(not(feature = "relay-minimal"))]
 pub mod logs;
+#[cfg(not(feature = "relay-minimal"))]
 pub(crate) mod probes;
+#[cfg(not(feature = "relay-minimal"))]
 pub mod rules;
+#[cfg(not(feature = "relay-minimal"))]
 pub mod runtime;
 pub mod selection;
 pub mod store;
 pub mod tracked_stream;
 pub mod url_test;
+#[cfg(not(feature = "relay-minimal"))]
 pub mod validation;

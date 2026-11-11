@@ -70,6 +70,7 @@ fn request() -> Message {
 }
 
 #[tokio::test]
+#[cfg(not(feature = "relay-minimal"))]
 async fn fake_dns_raw_forwarding_over_verified_tls_preserves_and_guards_answers() {
     use crate::resolver::{DnsExchangeFuture, ResolveFuture, Resolver};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -533,10 +534,16 @@ async fn assert_slow_setup_survives(concurrent: bool, fail_last: bool) {
             connection: Mutex::new(None),
         });
     }
+    let (stop_server, stopped) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
-        for _ in 0..3 + usize::from(concurrent) {
-            let answer = read_tcp(&mut stream).await.into_response();
+        tokio::pin!(stopped);
+        loop {
+            let request = tokio::select! {
+                request = read_tcp(&mut stream) => request,
+                _ = &mut stopped => break,
+            };
+            let answer = request.into_response();
             write_tcp(&mut stream, answer).await;
         }
     });
@@ -582,6 +589,9 @@ async fn assert_slow_setup_survives(concurrent: bool, fail_last: bool) {
         requests.await;
     }
     assert_eq!(builds.load(Ordering::SeqCst), 1);
+    // Minimal mode can coalesce the overlapping queries, so completion must
+    // not require one TCP request for every caller.
+    stop_server.send(()).unwrap();
     server.await.unwrap();
 }
 

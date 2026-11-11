@@ -1,9 +1,6 @@
 use super::{packet::PacketBuffer, wake::Wake};
 use crate::atomic::AtomicU64;
-use crate::{
-    async_stream::*,
-    resources::{Budget, BudgetPermit},
-};
+use crate::{async_stream::*, resources::Budget, udp_budget};
 use parking_lot::Mutex;
 use std::{
     collections::VecDeque,
@@ -19,7 +16,6 @@ const FLOW_QUEUE_CAPACITY: usize = 8;
 
 pub(crate) struct Datagram {
     pub packet: PacketBuffer,
-    _permit: BudgetPermit,
 }
 
 pub(crate) struct UdpControl {
@@ -38,12 +34,11 @@ impl UdpControl {
         if self.closed || self.incoming.len() == FLOW_QUEUE_CAPACITY {
             return false;
         }
-        let Some(permit) = self.budget.acquire(packet.len()) else {
+        let Some(permits) = udp_budget::reserve(&self.budget, packet.len()) else {
             return false;
         };
         self.incoming.push_back(Datagram {
-            packet: packet.into_payload(true),
-            _permit: permit,
+            packet: packet.into_payload(true).with_lease(Arc::new(permits)),
         });
         if let Some(waker) = self.reader.take() {
             waker.wake();
@@ -114,25 +109,48 @@ impl AsyncWriteMessage for UdpConnection {
         if control.closed {
             return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
         }
-        let overhead = if control.local.is_ipv4() { 28 } else { 48 };
-        if data.len() > self.mtu - overhead {
-            self.drops.fetch_add(1, Ordering::Relaxed);
-            return Poll::Ready(Ok(()));
+        let ipv4 = control.local.is_ipv4();
+        let overhead = if ipv4 { 28 } else { 48 };
+        if data.len() > if ipv4 { 65507 } else { 65527 } {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "UDP payload exceeds IP length limit",
+            )));
         }
         if control.outgoing.len() == FLOW_QUEUE_CAPACITY {
             control.writer = Some(cx.waker().clone());
             return Poll::Pending;
         }
-        let Some(permit) = control.budget.acquire(data.len() + overhead) else {
+        let reservation =
+            super::ipv4_fragments::output_reservation(data.len() + overhead, ipv4, self.mtu)?;
+        let Some(permits) = udp_budget::reserve(&control.budget, reservation) else {
             self.drops.fetch_add(1, Ordering::Relaxed);
             return Poll::Ready(Ok(()));
         };
-        let packet =
-            crate::tun::udp_handler::build_udp_packet(data, control.local, control.remote)?;
-        control.outgoing.push_back(Datagram {
-            packet: packet.into_payload(true),
-            _permit: permit,
-        });
+        // This path deliberately uses exact, nonpooled storage: small datagrams
+        // must not pin a jumbo packet allocation or hide capacity from budgets.
+        let builder = match (control.local, control.remote) {
+            (SocketAddr::V4(local), SocketAddr::V4(remote)) => {
+                etherparse::PacketBuilder::ipv4(local.ip().octets(), remote.ip().octets(), 64)
+                    .udp(local.port(), remote.port())
+            }
+            (SocketAddr::V6(local), SocketAddr::V6(remote)) => {
+                etherparse::PacketBuilder::ipv6(local.ip().octets(), remote.ip().octets(), 64)
+                    .udp(local.port(), remote.port())
+            }
+            _ => {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "UDP address family mismatch",
+                )));
+            }
+        };
+        let mut bytes = vec![0; builder.size(data.len())];
+        builder
+            .write(&mut &mut bytes[..], data)
+            .map_err(io::Error::other)?;
+        let packet = PacketBuffer::from_vec(bytes).with_lease(Arc::new(permits));
+        control.outgoing.push_back(Datagram { packet });
         drop(control);
         self.wake.notify();
         Poll::Ready(Ok(()))

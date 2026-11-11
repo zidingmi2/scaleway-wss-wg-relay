@@ -639,7 +639,11 @@ impl<'a> UdpRouter<'a> {
                     p
                 }
                 Poll::Ready(Err(e)) => {
-                    warn!("server read error: {}", e);
+                    if e.kind() == io::ErrorKind::BrokenPipe {
+                        debug!("UDP association closed: {}", e);
+                    } else {
+                        warn!("server read error: {}", e);
+                    }
                     self.set_server_read_eof();
                     break;
                 }
@@ -1597,5 +1601,5 @@ pub async fn run_udp_routing(
     result
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "relay-minimal")))]
 mod tests;

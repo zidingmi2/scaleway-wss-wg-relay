@@ -7,6 +7,7 @@ fn validate(yaml: &str) -> std::io::Result<ValidatedConfigs> {
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn hosts_compose_with_local_then_reference_order_precedence() {
     let validated = validate(
         r#"
@@ -53,6 +54,7 @@ fn hosts_compose_with_local_then_reference_order_precedence() {
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn hosts_only_inline_defaults_and_explicit_dns_replacement() {
     let validated = validate(
         r#"
@@ -102,6 +104,7 @@ fn hosts_only_inline_defaults_and_explicit_dns_replacement() {
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn hosts_overlay_on_fake_group_requires_an_explicit_context_policy() {
     let mut config = json!([
         {"dns_group": "shared", "dns_servers": "system", "fake_ip": true},
@@ -134,6 +137,7 @@ fn hosts_overlay_on_fake_group_requires_an_explicit_context_policy() {
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn hosts_reject_hijacked_tun_endpoints_without_fake_dns() {
     for ip in ["10.233.0.1", "::ffff:10.233.0.1", "10.233.0.2"] {
         let mut config = json!([
@@ -192,6 +196,7 @@ fn hosts_reject_managed_tun_endpoints_without_fake_dns() {
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn hosts_reject_protected_addresses_and_preserve_empty_serialization() {
     for ip in ["198.18.0.5", "::ffff:198.18.0.5", "2001:2::5"] {
         let config = json!([

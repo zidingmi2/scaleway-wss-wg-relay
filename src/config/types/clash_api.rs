@@ -210,6 +210,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn flat_clash_api_entries_share_one_control_config() {
         let configs = serde_yaml::from_str(
             "- clash_api_address: '0.0.0.0:9090'\n  secret: first\n\

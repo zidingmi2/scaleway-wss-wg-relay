@@ -7,6 +7,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 use crate::dns::ParsedDnsUrl;
 use crate::option_util::{NoneOrOne, NoneOrSome, OneOrSome};
+#[cfg(not(feature = "relay-minimal"))]
 use crate::reality::{decode_private_key, decode_short_id};
 use crate::thread_util::get_num_threads;
 use crate::uuid_util::parse_uuid;
@@ -25,6 +26,147 @@ use super::types::{
 };
 
 const MIN_TLS_BUFFER_SIZE: usize = 16 * 1024;
+
+#[cfg(feature = "relay-minimal")]
+fn minimal_unsupported(capability: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        format!("{capability} is not enabled in relay-minimal"),
+    )
+}
+
+#[cfg(feature = "relay-minimal")]
+fn validate_minimal_capabilities(configs: &mut [Config]) -> std::io::Result<()> {
+    // Reject removed capabilities before certificate/rule preparation can read
+    // files or create any network dependencies. Keeping their schema variants
+    // permits an explicit error instead of silently ignoring an option.
+    for config in configs.iter() {
+        match config {
+            Config::ClashApi(_) | Config::CacheFile(_) => {
+                return Err(minimal_unsupported("controller or persistent state"));
+            }
+            Config::CertificateSource(_) | Config::NamedPem(_) => {
+                return Err(minimal_unsupported("certificate management"));
+            }
+            Config::TunServer(_) => return Err(minimal_unsupported("OS TUN")),
+            Config::RuleSourceGroup(_) => return Err(minimal_unsupported("rule sources")),
+            Config::GlobalSettings(settings) => {
+                if settings.ntp.is_some() || settings.rule_cache_dir.is_some() {
+                    return Err(minimal_unsupported("NTP or rule cache"));
+                }
+                if settings
+                    .default_dns
+                    .as_ref()
+                    .is_some_and(|dns| dns.fake_ip.is_some())
+                {
+                    return Err(minimal_unsupported("fake-IP DNS"));
+                }
+            }
+            Config::ClientConfigGroup(group) => {
+                if group.group_type != super::GroupType::RoundRobin || group.default.is_some() {
+                    return Err(minimal_unsupported("client selection or health probes"));
+                }
+            }
+            Config::Server(server) => validate_minimal_server(server)?,
+            Config::DnsConfigGroup(group) if group.fake_ip.is_some() => {
+                return Err(minimal_unsupported("fake-IP DNS"));
+            }
+            _ => {}
+        }
+    }
+    crate::rule_set::visit_sources(configs, &mut |_| {
+        Err(minimal_unsupported("file or remote rule sources"))
+    })?;
+    super::client_visit::visit_source_configs(configs, &mut |client| {
+        validate_minimal_client(client)
+    })
+}
+
+#[cfg(feature = "relay-minimal")]
+fn validate_minimal_client(client: &ClientConfig) -> std::io::Result<()> {
+    if client.control.is_some() || client.quic_settings.is_some() {
+        return Err(minimal_unsupported("client controller or QUIC settings"));
+    }
+    match &client.protocol {
+        ClientProxyConfig::Direct if client.transport == Transport::Tcp => Ok(()),
+        ClientProxyConfig::Wireguard(config) if client.transport == Transport::Udp => {
+            if config.peer_client_chain.is_some() {
+                return Err(minimal_unsupported("nested WireGuard carrier chains"));
+            }
+            if client.address.address().hostname().is_some() {
+                return Err(minimal_unsupported("WireGuard peer hostname bootstrap"));
+            }
+            Ok(())
+        }
+        _ => Err(minimal_unsupported("outbound protocol or transport")),
+    }
+}
+
+#[cfg(feature = "relay-minimal")]
+fn validate_minimal_server(server: &ServerConfig) -> std::io::Result<()> {
+    if server.quic_settings.is_some() || server.sniff {
+        return Err(minimal_unsupported("QUIC settings or protocol sniffing"));
+    }
+    if server.rules.is_empty() {
+        return Err(minimal_unsupported("implicit direct-egress rules"));
+    }
+    if server.dns.as_ref().is_some_and(|dns| dns.fake_ip.is_some()) {
+        return Err(minimal_unsupported("fake-IP DNS"));
+    }
+    match (&server.protocol, &server.transport) {
+        (ServerProxyConfig::Wireguard(config), Transport::Udp) => {
+            if config.peer_client_chain.is_some() {
+                return Err(minimal_unsupported("nested WireGuard carrier chains"));
+            }
+            Ok(())
+        }
+        (protocol, Transport::Tcp) => validate_minimal_stream_protocol(protocol),
+        _ => Err(minimal_unsupported("inbound protocol or transport")),
+    }
+}
+
+#[cfg(feature = "relay-minimal")]
+fn validate_minimal_stream_protocol(protocol: &ServerProxyConfig) -> std::io::Result<()> {
+    match protocol {
+        ServerProxyConfig::Trojan {
+            shadowsocks: None, ..
+        } => validate_server_auth(protocol),
+        ServerProxyConfig::Websocket { targets } => {
+            if targets.iter().next().is_none() {
+                return Err(minimal_unsupported("empty WebSocket targets"));
+            }
+            for target in targets.iter() {
+                if !matches!(
+                    &target.protocol,
+                    ServerProxyConfig::Trojan {
+                        shadowsocks: None,
+                        ..
+                    }
+                ) {
+                    return Err(minimal_unsupported("WebSocket inner protocol"));
+                }
+                validate_server_auth(&target.protocol)?;
+            }
+            Ok(())
+        }
+        _ => Err(minimal_unsupported("stream protocol")),
+    }
+}
+
+#[cfg(feature = "relay-minimal")]
+fn validate_minimal_ingress_routes(rules: &NoneOrSome<ResolvedRuleConfig>) -> std::io::Result<()> {
+    for rule in rules.iter() {
+        if let ResolvedRuleActionConfig::Allow { client_chains, .. } = &rule.action
+            && (client_chains.is_empty()
+                || client_chains
+                    .iter()
+                    .any(|chain| !chain_uses_wireguard(chain)))
+        {
+            return Err(minimal_unsupported("Trojan ingress direct-egress route"));
+        }
+    }
+    Ok(())
+}
 
 /// Result of config validation containing server configs and expanded DNS groups.
 /// DNS resolvers are built at runtime from the expanded groups.
@@ -88,6 +230,8 @@ pub(super) fn create_server_configs_with_memory(
     mut all_configs: Vec<Config>,
     memory: Option<crate::rule_set::MemorySources>,
 ) -> std::io::Result<ValidatedConfigs> {
+    #[cfg(feature = "relay-minimal")]
+    validate_minimal_capabilities(&mut all_configs)?;
     crate::rule_set::validate_remote_paths(&mut all_configs, &[])?;
     let rule_cache_dir = crate::rule_set::cache_directory(&all_configs)?;
 
@@ -1071,7 +1215,8 @@ fn validate_dns_group_ref(
 ///
 /// Expands client chains (resolves group refs to configs) and validates:
 /// - Inline client configs (PEMs, etc.)
-/// - Protocol compatibility (system doesn't support chains, UDP/H3 only direct chains)
+/// - Protocol compatibility (system has no chains, UDP requires UDP-capable chains,
+///   H3 requires direct chains)
 /// - System-only use of native_cache_secs
 /// - Bootstrap URL validity (must be a known group or valid IP-only URL)
 fn expand_dns_specs(
@@ -1119,7 +1264,8 @@ fn expand_dns_specs(
                 ));
             }
 
-            // Check if all chains are direct-only (for UDP/H3 validation)
+            // UDP DNS may use a datagram-capable proxy/WireGuard chain. Validate
+            // every selectable chain so a failed tunnel never becomes direct DNS.
             let all_direct = expanded_chains
                 .iter()
                 .all(|chain| super::composition::direct_only(&chain.hops));
@@ -1127,9 +1273,13 @@ fn expand_dns_specs(
             if !all_direct {
                 match &parsed_url {
                     ParsedDnsUrl::Udp { .. } => {
-                        return Err(std::io::Error::other(
-                            "UDP DNS only supports direct client_chain (for bind_interface)",
-                        ));
+                        for chain in &expanded_chains {
+                            if !crate::tcp::chain_builder::supports_udp_offline(chain)? {
+                                return Err(std::io::Error::other(
+                                    "UDP DNS requires a UDP-capable client_chain",
+                                ));
+                            }
+                        }
                     }
                     ParsedDnsUrl::H3 { .. } => {
                         return Err(std::io::Error::other(
@@ -1199,6 +1349,9 @@ fn resolve_server_config(
     named_pems: &HashMap<String, String>,
     global_limits: GlobalLimits,
 ) -> std::io::Result<ResolvedServerConfig> {
+    #[cfg(feature = "relay-minimal")]
+    validate_minimal_server(&server_config)?;
+    #[cfg(not(feature = "relay-minimal"))]
     crate::sudoku_mask::validate_server(&server_config.protocol, &server_config.transport)?;
     if let ServerProxyConfig::Wireguard(config) = &server_config.protocol {
         if server_config.transport != Transport::Udp
@@ -1271,6 +1424,7 @@ fn resolve_server_config(
             "server requires an address or path",
         ));
     }
+    #[cfg(not(feature = "relay-minimal"))]
     super::types::xhttp::validate_server_transport(
         &server_config.protocol,
         &server_config.transport,
@@ -1291,6 +1445,7 @@ fn resolve_server_config(
         ));
     }
     // First handle QUIC settings certificates
+    #[cfg(not(feature = "relay-minimal"))]
     if let Some(ref mut quic_settings) = server_config.quic_settings {
         if let ServerProxyConfig::TuicV5 {
             zero_rtt_handshake, ..
@@ -1319,6 +1474,7 @@ fn resolve_server_config(
         ));
     }
 
+    #[cfg(not(feature = "relay-minimal"))]
     if server_config.transport == Transport::Quic {
         match server_config.quic_settings {
             Some(ServerQuicConfig {
@@ -1369,6 +1525,8 @@ fn resolve_server_config(
             global_limits,
         )
     })?;
+    #[cfg(feature = "relay-minimal")]
+    validate_minimal_ingress_routes(&rules)?;
     let protocol = resolve_server_proxy_config(
         server_config.protocol,
         client_groups,
@@ -1406,6 +1564,7 @@ pub(super) fn source_contains_xhttp(protocol: &ClientProxyConfig) -> bool {
     }
 }
 
+#[cfg(not(feature = "relay-minimal"))]
 fn normalize_fingerprints(
     fingerprints: &mut NoneOrSome<String>,
     peer: &str,
@@ -1424,6 +1583,7 @@ fn normalize_fingerprints(
 }
 
 /// Validates Reality private_key to ensure it's a valid base64url-encoded X25519 key.
+#[cfg(not(feature = "relay-minimal"))]
 fn validate_reality_private_key(private_key: &str, target_name: &str) -> std::io::Result<()> {
     decode_private_key(private_key).map_err(|e| {
         std::io::Error::new(
@@ -1439,6 +1599,7 @@ fn validate_reality_private_key(private_key: &str, target_name: &str) -> std::io
 }
 
 /// Validates Reality client short_id to ensure it's a valid hexadecimal string
+#[cfg(not(feature = "relay-minimal"))]
 fn validate_reality_client_short_id(short_id: &str) -> std::io::Result<()> {
     if short_id.len() > 16 {
         return Err(std::io::Error::new(
@@ -1472,6 +1633,7 @@ fn validate_reality_client_short_id(short_id: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(not(feature = "relay-minimal"))]
 fn validate_reality_server_short_ids(
     short_ids: &OneOrSome<String>,
     target_name: &str,
@@ -1580,6 +1742,15 @@ pub(crate) fn validate_resolved_client_vision_protocol(
 }
 
 /// Recursive validation of client proxy config structure (Vision rules, etc.)
+#[cfg(feature = "relay-minimal")]
+fn validate_client_proxy_structure(config: &ClientProxyConfig) -> std::io::Result<()> {
+    match config {
+        ClientProxyConfig::Direct | ClientProxyConfig::Wireguard(_) => Ok(()),
+        _ => Err(minimal_unsupported("outbound protocol")),
+    }
+}
+
+#[cfg(not(feature = "relay-minimal"))]
 fn validate_client_proxy_structure(config: &ClientProxyConfig) -> std::io::Result<()> {
     let inner = match config {
         ClientProxyConfig::SudokuMask(config) => Some(config.protocol.as_ref()),
@@ -1634,10 +1805,15 @@ pub(super) fn resolve_client_config(
     named_pems: &HashMap<String, String>,
     global_limits: GlobalLimits,
 ) -> std::io::Result<ResolvedClientConfig> {
-    #[cfg(test)]
+    #[cfg(all(test, not(feature = "relay-minimal")))]
     tests::CLIENT_VALIDATIONS.with(|count| count.set(count.get() + 1));
+    #[cfg(feature = "relay-minimal")]
+    validate_minimal_client(&client_config)?;
+    #[cfg(not(feature = "relay-minimal"))]
     crate::sudoku_mask::validate_client(&client_config.protocol, &client_config.transport)?;
+    #[cfg(not(feature = "relay-minimal"))]
     client_config.validate_quic_key_exchange(true)?;
+    #[cfg(not(feature = "relay-minimal"))]
     crate::quic_client::validate(&client_config, true)?;
     let mut resolved_carrier = None;
     if let ClientProxyConfig::Wireguard(config) = &mut client_config.protocol {
@@ -1674,6 +1850,7 @@ pub(super) fn resolve_client_config(
         ));
     }
 
+    #[cfg(not(feature = "relay-minimal"))]
     if let Some(ref mut quic_config) = client_config.quic_settings {
         if client_config.transport != Transport::Quic {
             return Err(std::io::Error::new(
@@ -1717,6 +1894,7 @@ pub(super) fn resolve_client_config(
     )?;
 
     let client_config = super::lower::client(client_config, resolved_carrier);
+    #[cfg(not(feature = "relay-minimal"))]
     if crate::xhttp::connector::contains(&client_config.protocol) {
         crate::xhttp::connector::build_with_limits(
             &client_config,
@@ -1728,6 +1906,16 @@ pub(super) fn resolve_client_config(
     Ok(client_config)
 }
 
+#[cfg(feature = "relay-minimal")]
+fn validate_client_proxy_config(
+    config: &mut ClientProxyConfig,
+    _named_pems: &HashMap<String, String>,
+    _default_sni: Option<&str>,
+) -> std::io::Result<()> {
+    validate_client_proxy_structure(config)
+}
+
+#[cfg(not(feature = "relay-minimal"))]
 fn validate_client_proxy_config(
     client_proxy_config: &mut ClientProxyConfig,
     named_pems: &HashMap<String, String>,
@@ -1874,6 +2062,7 @@ fn validate_client_proxy_config(
     Ok(())
 }
 
+#[cfg(not(feature = "relay-minimal"))]
 fn validate_sni(sni: &str) -> std::io::Result<()> {
     rustls::pki_types::ServerName::try_from(sni)
         .map(|_| ())
@@ -1882,6 +2071,7 @@ fn validate_sni(sni: &str) -> std::io::Result<()> {
         })
 }
 
+#[cfg(not(feature = "relay-minimal"))]
 fn validate_server_certificates(
     cert: &str,
     key: &str,
@@ -1900,6 +2090,7 @@ fn validate_server_certificates(
     .map(|_| ())
 }
 
+#[cfg(not(feature = "relay-minimal"))]
 fn validate_client_certificates(cert: Option<&str>, key: Option<&str>) -> std::io::Result<()> {
     if let (Some(cert), Some(key)) = (cert, key) {
         crate::rustls_config_util::try_create_client_config(
@@ -1915,6 +2106,7 @@ fn validate_client_certificates(cert: Option<&str>, key: Option<&str>) -> std::i
     Ok(())
 }
 
+#[cfg(not(feature = "relay-minimal"))]
 fn validate_vmess_cipher(cipher: &str) -> std::io::Result<()> {
     crate::vmess::DataCipher::try_from(cipher).map(|_| ())
 }
@@ -2008,7 +2200,21 @@ fn validate_server_auth(protocol: &ServerProxyConfig) -> std::io::Result<()> {
             password,
             shadowsocks,
         } => {
-            validate_nonempty_secret(password, "Trojan")?;
+            #[cfg(feature = "relay-minimal")]
+            if shadowsocks.is_some() {
+                return Err(minimal_unsupported("Trojan Shadowsocks wrapper"));
+            }
+            let mut count = 0;
+            for password in password.iter() {
+                validate_nonempty_secret(password, "Trojan")?;
+                count += 1;
+            }
+            if count == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Trojan server requires at least one password",
+                ));
+            }
             if let Some(ShadowsocksConfig::Legacy { password, .. }) = shadowsocks {
                 validate_nonempty_secret(password, "Trojan Shadowsocks")?;
             }
@@ -2039,6 +2245,7 @@ fn validate_server_auth(protocol: &ServerProxyConfig) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(not(feature = "relay-minimal"))]
 fn validate_server_proxy_scalars(
     server_proxy_config: &mut ServerProxyConfig,
     context: ServerProtocolContext,
@@ -2138,6 +2345,63 @@ fn validate_server_proxy_scalars(
     Ok(())
 }
 
+#[cfg(feature = "relay-minimal")]
+fn resolve_server_proxy_config(
+    source: ServerProxyConfig,
+    groups: &compiler::Groups,
+    rules: &HashMap<String, Vec<RuleConfig>>,
+    pems: &HashMap<String, String>,
+    limits: GlobalLimits,
+    _context: ServerProtocolContext,
+) -> std::io::Result<ResolvedServerProxyConfig> {
+    validate_minimal_stream_protocol(&source)?;
+    match source {
+        ServerProxyConfig::Trojan {
+            password,
+            shadowsocks: None,
+        } => Ok(ResolvedServerProxyConfig::Trojan {
+            password,
+            shadowsocks: None,
+        }),
+        ServerProxyConfig::Websocket { targets } => {
+            let targets = plan_ops::map_one(*targets, &mut |config| {
+                crate::websocket::validate_early_data(
+                    config.matching_path.as_deref(),
+                    config.matching_headers.as_ref(),
+                    config.max_early_data,
+                    config.early_data_header_name.as_deref(),
+                    true,
+                )?;
+                let protocol = resolve_server_proxy_config(
+                    config.protocol,
+                    groups,
+                    rules,
+                    pems,
+                    limits,
+                    ServerProtocolContext::Stream,
+                )?;
+                let override_rules =
+                    resolve_rules(config.override_rules, groups, rules, pems, limits)?;
+                validate_minimal_ingress_routes(&override_rules)?;
+                Ok::<_, std::io::Error>(ResolvedWebsocketServerConfig {
+                    matching_path: config.matching_path,
+                    matching_headers: config.matching_headers,
+                    max_early_data: config.max_early_data,
+                    early_data_header_name: config.early_data_header_name,
+                    protocol,
+                    ping_type: config.ping_type,
+                    override_rules,
+                })
+            })?;
+            Ok(ResolvedServerProxyConfig::Websocket {
+                targets: Box::new(targets),
+            })
+        }
+        _ => Err(minimal_unsupported("stream protocol")),
+    }
+}
+
+#[cfg(not(feature = "relay-minimal"))]
 fn resolve_server_proxy_config(
     mut source: ServerProxyConfig,
     groups: &compiler::Groups,
@@ -2511,6 +2775,7 @@ fn resolve_server_proxy_config(
     })
 }
 
+#[cfg(not(feature = "relay-minimal"))]
 fn resolve_tls_server(
     mut config: TlsServerConfig,
     groups: &compiler::Groups,
@@ -2712,7 +2977,7 @@ fn resolve_dns_binding(dns: Option<DnsConfig>) -> Option<ResolvedDnsConfig> {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "relay-minimal")))]
 mod tests;
 
 #[cfg(test)]
@@ -2720,3 +2985,70 @@ mod default_dns_tests;
 
 #[cfg(test)]
 mod hosts_tests;
+
+#[cfg(all(test, feature = "relay-minimal"))]
+mod minimal_tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn listener(protocol: Value) -> Value {
+        json!({"address":"127.0.0.1:8080", "protocol":protocol, "rules":"block-all"})
+    }
+
+    fn validate(value: Value) -> std::io::Result<ValidatedConfigs> {
+        create_server_configs(serde_json::from_value(value).unwrap())
+    }
+
+    #[test]
+    fn minimal_profile_accepts_trojan_websocket_with_multiple_passwords() {
+        let result = validate(json!([listener(json!({
+            "type":"websocket",
+            "targets":[{
+                "matching_path":"/relay/offline",
+                "protocol":{"type":"trojan","password":["offline-one","offline-two"]}
+            }]
+        }))]))
+        .unwrap();
+        assert_eq!(result.configs.len(), 1);
+    }
+
+    #[test]
+    fn minimal_profile_rejects_removed_protocols_and_implicit_direct_rules() {
+        for protocol in [
+            json!({"type":"socks"}),
+            json!({"type":"http"}),
+            json!({"type":"trojan", "password":"offline", "shadowsocks":{
+                "cipher":"aes-128-gcm", "password":"offline-wrapper"
+            }}),
+            json!({"type":"websocket", "targets":[{"protocol":{"type":"socks"}}]}),
+        ] {
+            let error = validate(json!([listener(protocol)])).err().unwrap();
+            assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        }
+        let mut no_rules = listener(json!({"type":"trojan", "password":"offline"}));
+        no_rules.as_object_mut().unwrap().remove("rules");
+        assert!(validate(json!([no_rules])).is_err());
+        let mut explicit_direct = listener(json!({"type":"trojan", "password":"offline"}));
+        explicit_direct["rules"] = json!("allow-all-direct");
+        assert!(validate(json!([explicit_direct])).is_err());
+        let override_direct = listener(json!({"type":"websocket", "targets":[{
+            "protocol":{"type":"trojan", "password":"offline"},
+            "override_rules":"allow-all-direct"
+        }]}));
+        assert!(validate(json!([override_direct])).is_err());
+    }
+
+    #[test]
+    fn minimal_profile_rejects_side_effectful_capabilities_before_preparation() {
+        for entry in [
+            json!({"global_settings":{"ntp":{"server":"192.0.2.1:123"}}}),
+            json!({"global_settings":{"rule_cache_dir":"/nonexistent/relay-cache"}}),
+            json!({"global_settings":{"default_dns":{"fake_ip":true}}}),
+            json!({"device_name":"offline-tun", "address":"10.0.0.1"}),
+            json!({"pem":"offline", "path":"/nonexistent/relay-certificate.pem"}),
+        ] {
+            let error = validate(json!([entry])).err().unwrap();
+            assert_eq!(error.kind(), std::io::ErrorKind::Unsupported, "{error}");
+        }
+    }
+}

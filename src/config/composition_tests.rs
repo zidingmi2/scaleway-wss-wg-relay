@@ -88,6 +88,7 @@ fn wireguard(carrier: Value) -> Value {
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn naive_choice_entries_and_shared_variable_suffixes_are_supported() {
     let naive = json!({"address":"192.0.2.20:443",
         "protocol":{"type":"naive", "username":"user", "password":"secret"}});
@@ -117,6 +118,7 @@ fn naive_choice_entries_and_shared_variable_suffixes_are_supported() {
 
 #[cfg(unix)]
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn health_review5_dynamic_wireguard_allowed_in_unused_groups_and_all_policies() {
     for kind in ["round-robin", "selector", "url-test"] {
         let mut carrier = json!({"client_group":"carrier", "type":kind,
@@ -135,6 +137,7 @@ fn health_review5_dynamic_wireguard_allowed_in_unused_groups_and_all_policies() 
 
 #[cfg(unix)]
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn health_review5_wireguard_health_covers_recursive_and_separate_hops() {
     let carrier = json!({"client_group":"carrier", "type":"selector", "client_chains":[{"chain": ["direct"]}, {"chain": [proxy("tcp-only")]}]});
     let mut inner = wireguard(json!("carrier"));
@@ -185,6 +188,7 @@ fn health_review5_wireguard_health_covers_recursive_and_separate_hops() {
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn naive_acceptance_covers_prefixes_wrappers_and_dns() {
     let naive = json!({"type":"naive", "username":"user", "password":"secret"});
     for protocol in [
@@ -223,6 +227,7 @@ fn naive_acceptance_covers_prefixes_wrappers_and_dns() {
 
 #[cfg(unix)]
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn health_review5_inline_carriers_are_expanded_without_route_health_restrictions() {
     let mut inner = wireguard(json!("carrier"))["client_chains"][0].clone();
     inner["address"] = json!("127.0.0.1:51821");
@@ -241,6 +246,7 @@ fn health_review5_inline_carriers_are_expanded_without_route_health_restrictions
 
 #[cfg(unix)]
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn health_review7_peer_chains_accept_dynamic_carriers_with_group_health() {
     let carrier = json!({"client_group":"carrier", "type":"selector",
         "client_chains":[{"chain": ["direct"]}, {"chain": [proxy("tcp-only")]}]});
@@ -278,6 +284,7 @@ fn health_review7_peer_chains_accept_dynamic_carriers_with_group_health() {
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn naive_allows_fixed_and_shared_variable_prefixes() {
     let naive = json!({"name":"naive", "address":"192.0.2.20:443",
         "protocol":{"type":"naive", "username":"user", "password":"secret"}});
@@ -304,6 +311,7 @@ fn naive_allows_fixed_and_shared_variable_prefixes() {
 
 #[cfg(unix)]
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn health_review5_static_wireguard_and_resolver_only_dynamics_remain_supported() {
     validate(json!([
         wireguard(json!("direct")),
@@ -322,6 +330,7 @@ fn health_review5_static_wireguard_and_resolver_only_dynamics_remain_supported()
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn selector_routes_do_not_enumerate_pool_products() {
     validate(json!([
         selector(json!([proxy("a"), proxy("b")])),
@@ -331,6 +340,7 @@ fn selector_routes_do_not_enumerate_pool_products() {
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn physical_hop_limit_accepts_sixty_four_flat_hops_but_not_sixty_five() {
     let hop = json!({"address":"192.0.2.10:80", "protocol":{"type":"http"}});
     validate(json!([server(json!(vec![hop.clone(); 64]))])).unwrap();
@@ -342,6 +352,7 @@ fn physical_hop_limit_accepts_sixty_four_flat_hops_but_not_sixty_five() {
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn physical_hop_limit_uses_the_longest_alternative_plus_the_suffix() {
     let hop = json!({"address":"192.0.2.10:80", "protocol":{"type":"http"}});
     let group = selector(json!([

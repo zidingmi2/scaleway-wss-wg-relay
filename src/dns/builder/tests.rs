@@ -45,6 +45,7 @@ fn make_spec(url: &str) -> ExpandedDnsSpec {
 }
 
 #[tokio::test]
+#[cfg(not(feature = "relay-minimal"))]
 async fn dns_client_chain_resolves_proxy_through_configured_bootstrap() {
     use hickory_resolver::net::runtime::RuntimeProvider;
 
@@ -107,6 +108,7 @@ async fn dns_client_chain_resolves_proxy_through_configured_bootstrap() {
 }
 
 #[tokio::test]
+#[cfg(not(feature = "relay-minimal"))]
 async fn dns_whole_path_choices_pin_connections_and_reselect_on_reconnect() {
     use hickory_resolver::proto::op::{Message, Query};
     use hickory_resolver::proto::rr::{Name, RData, Record, RecordType, rdata};
@@ -216,6 +218,7 @@ fn fake_groups(enabled: bool) -> Vec<ExpandedDnsGroup> {
 }
 
 #[tokio::test]
+#[cfg(not(feature = "relay-minimal"))]
 async fn native_cache_policy_distinguishes_implicit_and_explicit_system() {
     for (dns, window) in [
         ("", Some(60)),
@@ -312,6 +315,7 @@ fn system_bootstrap_dependencies_preserve_named_group_precedence() {
 }
 
 #[tokio::test]
+#[cfg(not(feature = "relay-minimal"))]
 async fn explicit_proxy_bootstrap_does_not_require_native_dns_preflight() {
     let mut groups = fake_groups(false);
     let spec = &mut groups[0].specs[0];
@@ -330,6 +334,7 @@ async fn explicit_proxy_bootstrap_does_not_require_native_dns_preflight() {
 }
 
 #[tokio::test]
+#[cfg(not(feature = "relay-minimal"))]
 async fn omitted_servers_keeps_default_cache_and_retired_pools_freeze_on_shutdown() {
     let configs = crate::config::create_server_configs(
         serde_yaml::from_str(
@@ -484,6 +489,7 @@ async fn real_only_tun_endpoints_are_guarded_only_when_intercepting() {
 }
 
 #[tokio::test]
+#[cfg(not(feature = "relay-minimal"))]
 async fn fake_context_reload_sharing_disable_and_reenable_keep_pool_identity() {
     let initial = build_dns_registry(fake_groups(true)).await.unwrap();
     let context = initial
@@ -768,6 +774,7 @@ async fn heterogeneous_group_retries_truncated_udp_over_configured_tcp() {
 }
 
 #[tokio::test]
+#[cfg(not(feature = "relay-minimal"))]
 async fn dns_bootstrap_uses_live_quic_admission_before_activation() {
     if std::env::var_os("SHOES_DNS_ADMISSION_TEST_CHILD").is_none() {
         shoes_test_support::isolated::run_isolated(
@@ -820,6 +827,7 @@ async fn dns_bootstrap_uses_live_quic_admission_before_activation() {
 }
 
 #[tokio::test]
+#[cfg(not(feature = "relay-minimal"))]
 async fn prepared_dns_chains_use_candidate_quic_windows() {
     if std::env::var_os("SHOES_DNS_CANDIDATE_TEST_CHILD").is_none() {
         shoes_test_support::isolated::run_isolated(

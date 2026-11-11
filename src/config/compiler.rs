@@ -239,12 +239,23 @@ fn validate_position(client: &DraftClient, offset: usize) -> io::Result<()> {
         DraftClient::Ready(client) => super::composition::validate_position(client, offset),
         DraftClient::Pending { source, .. } => {
             source.validate_quic_key_exchange(offset == 0)?;
-            crate::quic_client::validate(source, offset == 0)?;
+            #[cfg(not(feature = "relay-minimal"))]
+            let xhttp_h3 = {
+                crate::quic_client::validate(source, offset == 0)?;
+                source.transport == super::Transport::Quic
+                    && super::validate::source_contains_xhttp(&source.protocol)
+            };
+            #[cfg(feature = "relay-minimal")]
+            let xhttp_h3 = {
+                if source.transport == super::Transport::Quic {
+                    return Err(invalid("QUIC transport is not included in relay-minimal"));
+                }
+                false
+            };
             super::composition::validate_position_flags(
                 source.protocol.is_direct(),
                 source.protocol.is_wireguard(),
-                source.transport == super::Transport::Quic
-                    && super::validate::source_contains_xhttp(&source.protocol),
+                xhttp_h3,
                 offset,
             )
         }

@@ -15,12 +15,13 @@ use crate::async_stream::{AsyncFlushMessage, AsyncMessageStream, AsyncStream};
 use crate::config::{BindLocation, ResolvedConfig, ResolvedServerConfig, TcpConfig, Transport};
 use crate::copy_bidirectional::copy_bidirectional;
 use crate::copy_bidirectional_message::copy_bidirectional_message;
+#[cfg(not(feature = "relay-minimal"))]
 use crate::quic_server::start_quic_servers;
 use crate::resolver::Resolver;
 use crate::routing::{ServerStream, run_udp_routing};
 use crate::socket_util::{new_tcp_listener, set_tcp_keepalive};
 use crate::tcp::tcp_handler::{TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult};
-#[cfg(unix)]
+#[cfg(all(unix, not(feature = "relay-minimal")))]
 use crate::tun::start_tun_server;
 use crate::util::write_all;
 
@@ -561,7 +562,7 @@ pub(crate) async fn start_servers_with_listeners(
     listeners: &mut TcpListeners,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     match config {
-        #[cfg(unix)]
+        #[cfg(all(unix, not(feature = "relay-minimal")))]
         ResolvedConfig::TunServer(tun_config) => {
             let task = tokio_util::task::AbortOnDropHandle::new(
                 start_tun_server(tun_config, resolver).await?,
@@ -575,7 +576,7 @@ pub(crate) async fn start_servers_with_listeners(
                 }
             })])
         }
-        #[cfg(not(unix))]
+        #[cfg(any(not(unix), feature = "relay-minimal"))]
         ResolvedConfig::TunServer(_) => Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "TUN server is not supported on this platform",
@@ -594,7 +595,15 @@ async fn start_tcp_or_quic_servers(
     let bind_location = config.bind_location.to_string();
     let join_handles = match config.transport {
         Transport::Tcp => start_tcp_servers(config, resolver, listeners).await?,
+        #[cfg(not(feature = "relay-minimal"))]
         Transport::Quic => start_quic_servers(config, resolver).await?,
+        #[cfg(feature = "relay-minimal")]
+        Transport::Quic => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "QUIC excluded from relay-minimal",
+            ));
+        }
         Transport::Udp => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
@@ -732,5 +741,5 @@ async fn start_tcp_servers(
     Ok(handles)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "relay-minimal")))]
 mod lifetime_tests;

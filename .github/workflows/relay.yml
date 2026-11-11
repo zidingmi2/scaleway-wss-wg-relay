@@ -1,0 +1,84 @@
+name: Relay offline verification and image
+on:
+  push:
+    branches: [relay-main]
+    tags: ['relay-v*']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: relay-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/scaleway-wss-wg-relay
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+      - name: Build offline verification environment
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          context: .
+          file: Dockerfile.relay
+          target: verification
+          platforms: linux/amd64
+          load: true
+          tags: relay-verification:local
+          build-args: SHOES_BUILD_REVISION=${{ github.sha }}
+          cache-from: type=gha,scope=relay-verify
+          cache-to: type=gha,scope=relay-verify,mode=max
+      - name: Run offline unit and protocol tests
+        run: docker run --rm --network none --memory 2g --cpus 2 relay-verification:local
+      - name: Build release-binary acceptance environment
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          context: .
+          file: Dockerfile.relay
+          target: acceptance
+          platforms: linux/amd64
+          load: true
+          tags: relay-acceptance:local
+          build-args: SHOES_BUILD_REVISION=${{ github.sha }}
+          cache-from: |
+            type=gha,scope=relay-verify
+            type=gha,scope=relay-release
+          cache-to: type=gha,scope=relay-release,mode=max
+      - name: Check release functionality in 128 MiB without external networking
+        run: docker run --rm --network none --memory 128m --memory-swap 128m --cpus 0.1 --pids-limit 128 relay-acceptance:local
+      - name: Sign in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish verified runtime image
+        if: github.event_name != 'pull_request'
+        id: image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8
+        with:
+          context: .
+          file: Dockerfile.relay
+          target: runtime
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.IMAGE }}:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.title=Scaleway WSS WireGuard relay
+          build-args: SHOES_BUILD_REVISION=${{ github.sha }}
+          cache-from: type=gha,scope=relay-release
+          provenance: mode=min
+      - name: Record immutable image
+        if: github.event_name != 'pull_request'
+        env:
+          DIGEST: ${{ steps.image.outputs.digest }}
+        run: printf '%s@%s\n' "$IMAGE" "$DIGEST" >> "$GITHUB_STEP_SUMMARY"

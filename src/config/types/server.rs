@@ -795,7 +795,8 @@ pub enum ServerProxyConfig {
         fallback: Option<NetLocation>,
     },
     Trojan {
-        password: String,
+        /// One or more accepted credentials. A string remains valid for existing configurations.
+        password: OneOrSome<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         shadowsocks: Option<ShadowsocksConfig>,
     },
@@ -993,7 +994,7 @@ pub enum ResolvedServerProxyConfig {
         fallback: Option<NetLocation>,
     },
     Trojan {
-        password: String,
+        password: OneOrSome<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         shadowsocks: Option<ShadowsocksConfig>,
     },

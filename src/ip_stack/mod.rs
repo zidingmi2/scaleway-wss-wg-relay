@@ -7,7 +7,9 @@ use smoltcp::{
 use tcp_conn::{TcpConnectionControl, TcpSocketState};
 
 pub(crate) mod driver;
+pub(crate) mod ipv4_fragments;
 pub(crate) mod packet;
+pub(crate) mod tcp_buffers;
 pub(crate) mod tcp_conn;
 #[cfg(test)]
 pub(crate) mod test_gate;

@@ -56,6 +56,7 @@ fn servers_inherit_global_default_dns_before_device_extraction() {
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn servers_keep_inbound_sniff_setting() {
     for sniff in [false, true] {
         let mut config = server();
@@ -114,6 +115,7 @@ fn server_names_and_public_keys_have_separate_stable_identities() {
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn server_identities_cannot_turn_private_dns_references_into_urls() {
     let mut identities = HashSet::new();
     for name in [
@@ -172,6 +174,7 @@ fn server_identities_cannot_turn_private_dns_references_into_urls() {
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn duplicate_server_identities_reject_with_or_without_fake_dns() {
     for name in [None, Some(""), Some("gateway")] {
         for fake_ip in [None, Some(false), Some(true)] {
@@ -210,6 +213,7 @@ fn duplicate_server_identities_reject_with_or_without_fake_dns() {
 }
 
 #[tokio::test]
+#[cfg(not(feature = "relay-minimal"))]
 async fn server_private_dns_ownership_survives_reordering_clients_and_key_rotation() {
     use crate::dns::{build_dns_registry, build_dns_registry_reusing};
 
@@ -312,6 +316,7 @@ async fn server_private_dns_ownership_survives_reordering_clients_and_key_rotati
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn proxied_servers_with_shared_keys_require_distinct_names() {
     let mut first = server();
     first.as_object_mut().unwrap().remove("address");
@@ -334,6 +339,7 @@ fn proxied_servers_with_shared_keys_require_distinct_names() {
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn servers_parse_literal_binds_and_reject_duplicates_and_implicit_policy() {
     for address in ["0.0.0.0:51820", "[::]:51820", "[fe80::1%3]:51820"] {
         let mut config = server();
@@ -422,6 +428,7 @@ fn servers_reject_port_range_syntax_for_a_single_distinct_port() {
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn proxied_servers_roundtrip_without_a_listener_and_require_return_mappings() {
     let mut config = server();
     config.as_object_mut().unwrap().remove("address");
@@ -449,6 +456,7 @@ fn proxied_servers_roundtrip_without_a_listener_and_require_return_mappings() {
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn wireguard_implies_udp_and_rejects_stream_transport_settings() {
     for transport in ["tcp", "quic"] {
         let mut client = client();
@@ -479,6 +487,7 @@ fn wireguard_implies_udp_and_rejects_stream_transport_settings() {
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn client_and_server_never_share_a_device() {
     let client = client();
     let mut server = server();
@@ -490,6 +499,7 @@ fn client_and_server_never_share_a_device() {
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn server_overrides_reject_other_active_and_retained_fake_ranges() {
     let mut inbound = server();
     inbound["rules"] = json!([{
@@ -526,6 +536,7 @@ fn copies(second: Value) -> Value {
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn copied_clients_share_after_defaults_and_normalization() {
     let mut second = client();
     second["address"] = json!("VPN.EXAMPLE:51820");
@@ -559,6 +570,7 @@ fn copied_clients_share_after_defaults_and_normalization() {
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn conflicting_copies_reject_every_device_setting_without_disclosing_keys() {
     for (field, value) in [
         ("mtu", json!(1280)),
@@ -596,6 +608,7 @@ fn conflicting_copies_reject_every_device_setting_without_disclosing_keys() {
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn copied_clients_share_with_equivalent_carrier_socket_defaults() {
     let mut first = client();
     first["protocol"]["peer_client_chain"] = json!("direct");
@@ -635,6 +648,7 @@ fn copied_clients_share_with_equivalent_carrier_socket_defaults() {
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn simplification_round_robin_carrier_names_do_not_affect_device_identity() {
     let mut first = client();
     first["protocol"]["peer_client_chain"] = json!("relay");
@@ -699,6 +713,7 @@ fn carrier_mtu_checks_single_hop_choice_members() {
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn copied_clients_share_local_addresses_with_different_prefix_lengths() {
     let mut second = client();
     second["protocol"]["addresses"] = json!(["10.77.0.2/24", "fd77::2/64"]);
@@ -711,6 +726,7 @@ fn copied_clients_share_local_addresses_with_different_prefix_lengths() {
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn different_client_identities_do_not_share() {
     for (pointer, value) in [
         ("/address", json!("other.example:51820")),
@@ -727,6 +743,7 @@ fn different_client_identities_do_not_share() {
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn scoped_endpoints_share_by_address_and_numeric_scope() {
     let mut first = client();
     first["address"] = json!("[FE80:0:0::1%03]:51820");
@@ -755,6 +772,7 @@ fn scoped_endpoints_share_by_address_and_numeric_scope() {
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn unused_groups_validate_without_starting_devices() {
     let configs = json!([{"client_group": "unused", "client_chains": [client()]}]);
     assert!(
@@ -769,6 +787,7 @@ fn unused_groups_validate_without_starting_devices() {
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn selectors_share_wireguard_devices_without_activating_unused_nodes() {
     let mut configs = json!([
         {"clash_api_address":"127.0.0.1:9090","secret":"test"},
@@ -790,6 +809,7 @@ fn selectors_share_wireguard_devices_without_activating_unused_nodes() {
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn unused_wireguard_dns_groups_validate_without_starting_devices() {
     let configs = json!([
         {"dns_group": "unused", "dns_servers": [{"url": "tcp://192.0.2.53", "client_chain": [client()]}]},
@@ -850,6 +870,7 @@ fn unused_wireguard_dns_groups_validate_without_starting_devices() {
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn discarded_dns_groups_keep_normalized_catalog_leaves() {
     let mut client = client();
     client["name"] = json!("dns-vpn");

@@ -689,7 +689,7 @@ fn read_source(source: &RuleSource, compiler: &mut Compiler) -> io::Result<Arc<P
             "rule source path must be absolute for string configs; file configs anchor paths to their declaring file",
         ));
     }
-    #[cfg(unix)]
+    #[cfg(all(unix, not(feature = "relay-minimal")))]
     if source.url.is_some() || compiler.remote_files.contains_key(&source.path) {
         let file = crate::rule_updater::cache_file(&source.path, None)
         .map_err(|error| {
@@ -890,6 +890,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn programmatic_source_groups_must_be_nonempty() {
         let config = Config::RuleSourceGroup(crate::config::RuleSourceGroup {
             rule_source_group: "empty".into(),

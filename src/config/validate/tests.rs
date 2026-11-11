@@ -686,6 +686,31 @@ fn server_secrets_must_be_nonempty() {
 }
 
 #[test]
+fn every_trojan_server_password_must_be_nonempty() {
+    for passwords in [
+        serde_json::json!(["owner", "wg-owner"]),
+        serde_json::json!(["owner", ""]),
+        serde_json::json!(["", "wg-owner"]),
+    ] {
+        let valid = passwords
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|p| !p.as_str().unwrap().is_empty());
+        let protocol = serde_json::from_value(serde_json::json!({
+            "type": "trojan", "password": passwords,
+        }))
+        .unwrap();
+        assert_eq!(validate_server_auth(&protocol).is_ok(), valid);
+    }
+    let empty = ServerProxyConfig::Trojan {
+        password: crate::option_util::OneOrSome::Some(Vec::new()),
+        shadowsocks: None,
+    };
+    assert!(validate_server_auth(&empty).is_err());
+}
+
+#[test]
 fn shadowsocks_identity_keys_validate_programmatic_clients_and_reject_servers() {
     for cipher in ["aes-128-gcm", "aes-256-gcm", "chacha20-poly1305"] {
         let cipher: crate::shadowsocks::ShadowsocksCipher = cipher.try_into().unwrap();
@@ -1983,7 +2008,7 @@ async fn test_dns_udp_with_proxy_chain_rejected() {
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
     assert!(
-        err.contains("UDP DNS only supports direct client_chain"),
+        err.contains("UDP DNS requires a UDP-capable client_chain"),
         "Expected UDP DNS client_chain error, got: {err}"
     );
 }

@@ -2,6 +2,7 @@ use super::*;
 use crate::config::{GlobalLimits, GroupType, ResolvedClientHop};
 use crate::control::selection::{Choices, SelectionView};
 use crate::option_util::OneOrSome;
+#[cfg(not(feature = "relay-minimal"))]
 use crate::tcp::proxy_connector_impl::ProxyConnectorImpl;
 use std::io;
 
@@ -254,9 +255,18 @@ fn node(
                 let udp = entry.supports_udp();
                 (Some(entry), None, udp)
             } else {
+                #[cfg(not(feature = "relay-minimal"))]
                 let proxy: Arc<dyn ProxyConnector> = Arc::new(
                     ProxyConnectorImpl::from_config(config, resolver.clone())?
                         .ok_or_else(unsupported)?,
+                );
+                #[cfg(feature = "relay-minimal")]
+                let proxy: Arc<dyn ProxyConnector> = Arc::from(
+                    crate::tcp::proxy_connector_impl::create_proxy_connector(
+                        config,
+                        resolver.clone(),
+                    )?
+                    .ok_or_else(unsupported)?,
                 );
                 let udp = proxy.supports_udp();
                 (None, Some(proxy), udp)
@@ -591,6 +601,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn forwarding_and_probe_routes_select_the_same_paths() {
         let (forwarding, catalog) = build(
             json!([
@@ -661,6 +672,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn mixed_length_selection_pins_the_whole_path_and_fails_udp_closed() {
         let (chain, catalog) = fixture();
         assert!(chain.may_connect_directly());
@@ -711,6 +723,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn route_names_preserve_nested_aliases_and_repeated_group_occurrences() {
         for kind in ["round-robin", "selector", "url-test"] {
             let leaf = |name| {
@@ -779,6 +792,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn route_names_keep_direct_stage_and_anonymous_catalog_identity() {
         let (chain, catalog) = build(
             json!([
@@ -816,6 +830,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn route_names_ignore_untracked_leaves_without_losing_shared_ancestry() {
         fn clear_origins(node: &mut Node, names: &[&str]) {
             match node {
@@ -858,6 +873,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(feature = "relay-minimal"))]
     async fn forwarding_failure_rechecks_only_the_selected_automatic_group() {
         use std::time::Duration;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -917,6 +933,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn same_length_alternatives_never_mix_their_hops() {
         for kind in ["selector", "round-robin"] {
             let (chain, catalog) = build(
@@ -956,6 +973,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn url_test_selects_complete_mixed_length_members_by_chain_label() {
         let (chain, catalog) = build(
             json!([{"client_group":"out", "type":"url-test", "url":"http://probe.invalid/", "tolerance":10,
@@ -999,6 +1017,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(feature = "relay-minimal"))]
     async fn forwarding_and_carrier_demand_wake_nested_lazy_groups() {
         use crate::async_stream::{AsyncReadMessage, AsyncWriteMessage};
         use std::time::Duration;
@@ -1070,6 +1089,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn config_round_robin_precomputes_transport_indices() {
         const MEMBERS: usize = 2048;
         let members: Vec<_> = (0..MEMBERS)
@@ -1133,6 +1153,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn download_rotation_resumes_nested_and_repeated_choices() {
         let config = json!([
             {"clash_api_address":"127.0.0.1:0","secret":"test"},
@@ -1178,6 +1199,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn nonterminal_choices_rotate_tcp_and_udp_independently() {
         for nested_selector in [false, true] {
             let (chain, _) = build(
@@ -1218,6 +1240,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn rejected_udp_paths_do_not_advance_earlier_round_robin_choices() {
         let (chain, catalog) = build(
             json!([
@@ -1267,6 +1290,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn nonterminal_url_test_keeps_tcp_and_udp_incumbents_separate() {
         let (chain, catalog) = build(
             json!([{"client_group":"out","type":"url-test","url":"http://192.0.2.1/","tolerance":50,"client_chains":[
@@ -1296,6 +1320,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn url_test_uses_group_samples_across_callers_without_overriding_round_robin() {
         let (chain, catalog) = build(
             json!([{"client_group":"out","type":"url-test","url":"http://192.0.2.1/","client_chains":[
@@ -1327,6 +1352,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(feature = "relay-minimal"))]
     async fn pinned_chain_keeps_connectors_after_composition_is_dropped() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1364,6 +1390,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn probe_connectors_do_not_advance_forwarding_counters_or_reselect_pinned_flows() {
         let (chain, catalog) = build(
             json!([

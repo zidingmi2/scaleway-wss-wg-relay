@@ -146,6 +146,7 @@ fn canonical_socket_addresses_preserve_native_ipv6_metadata() {
 }
 
 #[tokio::test]
+#[cfg(not(feature = "relay-minimal"))]
 async fn wireguard_tcp_udp_both_families_empty_outer_and_reload_rebind() {
     tokio::time::timeout(Duration::from_secs(20), async {
         let reservation = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
@@ -177,6 +178,7 @@ async fn wireguard_tcp_udp_both_families_empty_outer_and_reload_rebind() {
 }
 
 #[tokio::test]
+#[cfg(not(feature = "relay-minimal"))]
 async fn wireguard_mapped_ipv4_destinations_use_the_ipv4_tunnel() {
     tokio::time::timeout(Duration::from_secs(5), async {
         let reservation = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
@@ -203,6 +205,7 @@ async fn wireguard_mapped_ipv4_destinations_use_the_ipv4_tunnel() {
 }
 
 #[tokio::test]
+#[cfg(not(feature = "relay-minimal"))]
 async fn wireguard_fake_dns_restores_tcp_and_udp_in_both_families() {
     use hickory_resolver::proto::{
         op::{Message, Query},
@@ -297,6 +300,7 @@ rules:
 }
 
 #[tokio::test]
+#[cfg(not(feature = "relay-minimal"))]
 async fn wireguard_config_sniffs_literal_and_restored_targets_without_rewriting() {
     use hickory_resolver::proto::{
         op::{Message, Query},
@@ -373,6 +377,7 @@ async fn wireguard_config_sniffs_literal_and_restored_targets_without_rewriting(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(not(feature = "relay-minimal"))]
 async fn wireguard_concurrent_tcp_transfers_preserve_all_data() {
     tokio::time::timeout(Duration::from_secs(20), async {
         let reservation = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
@@ -412,6 +417,7 @@ async fn wireguard_concurrent_tcp_transfers_preserve_all_data() {
 }
 
 #[tokio::test]
+#[cfg(not(feature = "relay-minimal"))]
 async fn wireguard_mapped_ipv4_outer_endpoint_uses_ipv4_transport() {
     tokio::time::timeout(Duration::from_secs(10), async {
         for listen in [
@@ -443,6 +449,7 @@ async fn wireguard_mapped_ipv4_outer_endpoint_uses_ipv4_transport() {
 }
 
 #[tokio::test]
+#[cfg(not(feature = "relay-minimal"))]
 async fn wireguard_ipv6_outer_transport() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let reservation = std::net::UdpSocket::bind("[::]:0").unwrap();
@@ -465,6 +472,7 @@ async fn wireguard_ipv6_outer_transport() {
 }
 
 #[tokio::test]
+#[cfg(not(feature = "relay-minimal"))]
 async fn wireguard_dual_stack_connect_falls_back_without_waiting_for_blackholed_ipv6() {
     #[derive(Debug)]
     struct DualStackResolver(Vec<SocketAddr>);
@@ -512,6 +520,7 @@ async fn wireguard_dual_stack_connect_falls_back_without_waiting_for_blackholed_
 }
 
 #[tokio::test]
+#[cfg(not(feature = "relay-minimal"))]
 async fn wireguard_bind_selects_a_compatible_hostname_address() {
     let mut configs = validate(&pair_config(51820)).unwrap();
     configs.wireguard_endpoints[CLIENT].peers[0].endpoint = Some("localhost:51820".into());
@@ -526,6 +535,7 @@ async fn wireguard_bind_selects_a_compatible_hostname_address() {
 }
 
 #[tokio::test]
+#[cfg(not(feature = "relay-minimal"))]
 async fn fake_dns_guards_wireguard_peer_and_outer_proxy_hostnames() {
     use serde_json::json;
     for tun_address in [None, Some("127.0.0.1"), Some("::ffff:127.0.0.1")] {
@@ -634,6 +644,7 @@ async fn fake_dns_guards_wireguard_peer_and_outer_proxy_hostnames() {
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn fake_dns_rejects_unbracketed_wireguard_literals() {
     use serde_json::json;
     for endpoint in ["::ffff:198.18.0.5:51820", "2001:2::5:51820"] {
@@ -655,6 +666,7 @@ fn fake_dns_rejects_unbracketed_wireguard_literals() {
 }
 
 #[tokio::test]
+#[cfg(not(feature = "relay-minimal"))]
 async fn wireguard_ipv4_fallback_selects_a_compatible_resolved_peer() {
     let mut configs = validate(&pair_config(51820)).unwrap();
     let mut prepared = Prepared::new(&mut configs).await.unwrap();
@@ -692,6 +704,7 @@ async fn wireguard_ipv4_fallback_selects_a_compatible_resolved_peer() {
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn wireguard_bind_validates_peer_address_families() {
     let mut configs = validate(&pair_config(51820)).unwrap();
     let client = &mut configs.wireguard_endpoints[CLIENT];
@@ -715,6 +728,7 @@ fn wireguard_bind_validates_peer_address_families() {
 }
 
 #[tokio::test]
+#[cfg(not(feature = "relay-minimal"))]
 async fn wireguard_copied_clients_share_a_connector_only_within_their_generation() {
     use serde_json::{Value, json};
     let mut raw: Value = serde_yaml::from_str(&pair_config(10001)).unwrap();
@@ -759,6 +773,7 @@ async fn wireguard_copied_clients_share_a_connector_only_within_their_generation
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn wireguard_validation_rejects_unsafe_or_ambiguous_configs() {
     use serde_json::{Value, json};
     let base = pair_config(10001);
@@ -803,6 +818,7 @@ fn wireguard_validation_rejects_unsafe_or_ambiguous_configs() {
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn wireguard_rejects_non_contributory_peer_keys() {
     let mut low_order = [0; 32];
     low_order[0] = 1;
@@ -823,6 +839,7 @@ fn wireguard_rejects_non_contributory_peer_keys() {
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn wireguard_dns_and_chain_constraints() {
     let base = pair_config(10001);
     let dns = |url: &str, extra: &str| {
@@ -872,6 +889,7 @@ fn wireguard_dns_and_chain_constraints() {
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn wireguard_rejects_duplicate_peers_and_cross_peer_route_overlaps() {
     let configs = validate(&pair_config(10001)).unwrap();
     let mut server = configs.wireguard_endpoints[SERVER].clone();
@@ -886,6 +904,7 @@ fn wireguard_rejects_duplicate_peers_and_cross_peer_route_overlaps() {
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn wireguard_outer_chain_validation_and_roundtrip() {
     use serde_json::json;
     let base: serde_json::Value = serde_yaml::from_str(&pair_config(51820)).unwrap();
@@ -986,6 +1005,7 @@ fn wireguard_outer_chain_validation_and_roundtrip() {
 }
 
 #[tokio::test]
+#[cfg(not(feature = "relay-minimal"))]
 async fn wireguard_outer_chain_requires_udp_before_starting() {
     for protocol in [
         "{type: socks}",
@@ -1030,6 +1050,7 @@ async fn wireguard_outer_chain_requires_udp_before_starting() {
 }
 
 #[tokio::test]
+#[cfg(not(feature = "relay-minimal"))]
 async fn wireguard_nested_outer_chain_and_reload() {
     use serde_json::{Value, json};
     // Concurrent harness forks can retain even CLOEXEC sockets until exec completes.
@@ -1087,6 +1108,7 @@ async fn wireguard_nested_outer_chain_and_reload() {
 }
 
 #[tokio::test]
+#[cfg(not(feature = "relay-minimal"))]
 async fn wireguard_detoured_endpoint_keeps_encrypted_peers_separate() {
     tokio::time::timeout(Duration::from_secs(15), async {
         let first = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
@@ -1135,6 +1157,7 @@ async fn wireguard_detoured_endpoint_keeps_encrypted_peers_separate() {
 }
 
 #[tokio::test]
+#[cfg(not(feature = "relay-minimal"))]
 async fn wireguard_chains_load_client_certificate_paths_before_validation() {
     use serde_json::{Value, json};
     let directory = tempfile::tempdir().unwrap();
@@ -1224,6 +1247,7 @@ async fn wireguard_chains_load_client_certificate_paths_before_validation() {
 }
 
 #[tokio::test]
+#[cfg(not(feature = "relay-minimal"))]
 async fn wireguard_replay_corruption_and_authenticated_endpoint_roaming() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let reservation = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
@@ -1342,6 +1366,7 @@ async fn wireguard_outer_socket_protection_failure_prevents_binding() {
 }
 
 #[tokio::test]
+#[cfg(not(feature = "relay-minimal"))]
 async fn wireguard_rejects_wrong_psk_spoofed_sources_and_unsolicited_flows() {
     tokio::time::timeout(Duration::from_secs(10), async {
         for failure in ["psk", "source", "inbound"] {
@@ -1395,6 +1420,7 @@ async fn wireguard_rejects_wrong_psk_spoofed_sources_and_unsolicited_flows() {
 }
 
 #[tokio::test]
+#[cfg(not(feature = "relay-minimal"))]
 async fn wireguard_multiple_peers_share_a_bind_without_cross_delivering_replies() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let reservation = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
@@ -1426,6 +1452,7 @@ async fn wireguard_multiple_peers_share_a_bind_without_cross_delivering_replies(
 }
 
 #[tokio::test]
+#[cfg(not(feature = "relay-minimal"))]
 async fn wireguard_dns_tcp_dot_doh_use_the_tunnel_and_fail_closed_after_stop() {
     use crate::client_proxy_chain::{ClientChainGroup, ClientProxyChain, InitialHopEntry};
     use hickory_resolver::{
@@ -1568,6 +1595,7 @@ async fn wireguard_dns_tcp_dot_doh_use_the_tunnel_and_fail_closed_after_stop() {
 }
 
 #[tokio::test]
+#[cfg(not(feature = "relay-minimal"))]
 async fn wireguard_unused_dns_groups_do_not_contact_peers() {
     use serde_json::json;
 
@@ -1612,6 +1640,7 @@ async fn wireguard_unused_dns_groups_do_not_contact_peers() {
 }
 
 #[tokio::test]
+#[cfg(not(feature = "relay-minimal"))]
 async fn wireguard_dns_registry_prepares_inactive_generation_handles() {
     use serde_json::json;
 

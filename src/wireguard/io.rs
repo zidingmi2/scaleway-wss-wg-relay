@@ -15,18 +15,40 @@ use tokio::sync::{mpsc, oneshot};
 pub(super) struct IpSink {
     pub sender: mpsc::Sender<PacketBuffer>,
     pub wake: Wake,
-    pub mtu: u16,
     pub drops: Arc<AtomicU64>,
 }
 impl IpSend for IpSink {
     async fn send(&mut self, packet: Packet<Ip>) -> io::Result<()> {
         let packet = packet.into_bytes();
-        if packet.len() > self.mtu as usize {
+        // The peer has its own interface MTU. Our local transmit MTU must not
+        // discard valid larger incoming IPv4 packets/fragments from that peer.
+        if packet.len() > 65_575 {
             self.drops.fetch_add(1, Ordering::Relaxed);
             return Ok(());
         }
+        // Charge decrypted UDP before copying it into the cross-thread queue.
+        // Fragmented IPv4 keeps protocol=UDP in every IP header, so this also
+        // covers fragments whose transport header is not present yet.
+        let udp = match packet.first().map(|byte| byte >> 4) {
+            Some(4) => packet.get(9) == Some(&17),
+            Some(6) => packet.get(6) == Some(&17),
+            _ => false,
+        };
+        let permit = if udp {
+            let Some(permit) = crate::udp_budget::global().acquire(packet.len()) else {
+                self.drops.fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            };
+            Some(permit)
+        } else {
+            None
+        };
+        let mut owned = PacketBuffer::copy_from_slice(&packet);
+        if let Some(permit) = permit {
+            owned = owned.with_lease(Arc::new(vec![permit]));
+        }
         self.sender
-            .send(PacketBuffer::copy_from_slice(&packet))
+            .send(owned)
             .await
             .map_err(|_| io::ErrorKind::BrokenPipe)?;
         self.wake.notify();
@@ -34,7 +56,7 @@ impl IpSend for IpSink {
     }
 }
 pub(super) struct IpSource {
-    pub receiver: mpsc::Receiver<PacketBuffer>,
+    pub receiver: crate::ip_stack::driver::OutputReceiver,
     pub mtu: u16,
 }
 impl IpRecv for IpSource {
@@ -63,6 +85,10 @@ struct Socket {
     socket: Option<tokio::net::UdpSocket>,
     closed: Option<oneshot::Sender<()>>,
     ipv6: bool,
+    // One bounded scratch allocation per carrier avoids truncating legitimate
+    // peer packets at the 4096-byte reusable GotaTun pool size. Small packets
+    // still reuse pooled storage; jumbo allocations are not retained by it.
+    receive_buffer: tokio::sync::Mutex<Box<[u8]>>,
 }
 impl Drop for Socket {
     fn drop(&mut self) {
@@ -109,6 +135,7 @@ impl Factory {
             socket: Some(socket),
             closed: Some(closed),
             ipv6: local.is_ipv6(),
+            receive_buffer: tokio::sync::Mutex::new(vec![0; 65535].into_boxed_slice()),
         }));
         Ok((
             Self(Some((
@@ -195,15 +222,15 @@ impl UdpSend for Udp {
 impl UdpRecv for Udp {
     type RecvManyBuf = ();
     async fn recv_from(&mut self, pool: &mut PacketBufPool) -> io::Result<(Packet, SocketAddr)> {
-        let mut packet = pool.get();
+        let mut buffer = self.0.receive_buffer.lock().await;
         let (len, source) = self
             .0
             .socket
             .as_ref()
             .unwrap()
-            .recv_from(packet.buf_mut())
+            .recv_from(buffer.as_mut())
             .await?;
-        packet.truncate(len);
+        let packet = pool.get().overwrite_with(&buffer[..len]);
         Ok((packet, super::canonical_socket_addr(source)))
     }
 }
@@ -213,6 +240,53 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn carrier_receive_does_not_truncate_at_packet_pool_capacity() {
+        let (mut factory, _released, address) =
+            Factory::new(Some("127.0.0.1:0".parse().unwrap()), None).unwrap();
+        let (_, mut receiver) = factory.0.take().unwrap();
+        let sender = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let payload = vec![0x7b; 5000];
+        sender.send_to(&payload, address).await.unwrap();
+        let mut pool: PacketBufPool = PacketBufPool::new(1);
+        let (packet, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            receiver.recv_from(&mut pool),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(packet.as_ref(), payload);
+    }
+
+    #[tokio::test]
+    async fn decrypted_udp_larger_than_local_transmit_mtu_is_preserved() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let (wake, _wake_rx) = Wake::new().unwrap();
+        let drops = Arc::default();
+        let mut sink = IpSink {
+            sender,
+            wake,
+            drops: Arc::clone(&drops),
+        };
+        let bytes = crate::tun::udp_handler::build_udp_packet(
+            &vec![0xa5; 5000],
+            "10.77.0.1:1".parse().unwrap(),
+            "10.77.0.2:2".parse().unwrap(),
+        )
+        .unwrap();
+        let pool: PacketBufPool = PacketBufPool::new(1);
+        let packet = pool.get().overwrite_with(&*bytes).try_into_ip().unwrap();
+        sink.send(packet).await.unwrap();
+        let received = receiver.recv().await.unwrap();
+        assert_eq!(&*received, &*bytes);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        assert!(
+            received.lease().is_some(),
+            "decrypted UDP queue retains its byte reservation"
+        );
+    }
+
+    #[tokio::test]
     async fn decrypted_packets_wait_for_capacity_and_fail_only_when_closed() {
         let (sender, mut receiver) = mpsc::channel(1);
         let (wake, _wake_rx) = Wake::new().unwrap();
@@ -220,7 +294,6 @@ mod tests {
         let mut sink = IpSink {
             sender,
             wake,
-            mtu: 1408,
             drops: Arc::clone(&drops),
         };
         let bytes = crate::tun::udp_handler::build_udp_packet(

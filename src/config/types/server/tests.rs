@@ -3,6 +3,37 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 
 #[test]
+fn trojan_server_password_accepts_a_string_or_nonempty_list() {
+    for value in [
+        serde_json::json!("owner"),
+        serde_json::json!(["owner", "wg-owner"]),
+    ] {
+        let protocol: ServerProxyConfig = serde_json::from_value(serde_json::json!({
+            "type": "trojan", "password": value,
+        }))
+        .unwrap();
+        let ServerProxyConfig::Trojan { ref password, .. } = protocol else {
+            panic!("expected Trojan protocol");
+        };
+        assert!(password.iter().count() >= 1);
+        assert_eq!(serde_json::to_value(&protocol).unwrap()["password"], value);
+    }
+    for value in [
+        serde_json::json!([]),
+        serde_json::json!(null),
+        serde_json::json!(["owner", 7]),
+    ] {
+        assert!(
+            serde_json::from_value::<ServerProxyConfig>(serde_json::json!({
+                "type": "trojan", "password": value,
+            }))
+            .is_err()
+        );
+    }
+}
+
+#[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn sniff_config_defaults_and_round_trips() {
     fn check<T: serde::de::DeserializeOwned + serde::Serialize>(base: &str) {
         let config: T = serde_yaml::from_str(base).unwrap();
@@ -145,7 +176,7 @@ fn create_test_server_config_trojan() -> ServerConfig {
         bind_location: NetLocation::from_ip_addr(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 443)
             .into(),
         protocol: ServerProxyConfig::Trojan {
-            password: "trojan_password".to_string(),
+            password: OneOrSome::One("trojan_password".to_string()),
             shadowsocks: Some(ShadowsocksConfig::Legacy {
                 cipher: "chacha20-poly1305".try_into().unwrap(),
                 password: "ss_password".to_string(),

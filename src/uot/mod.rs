@@ -38,13 +38,17 @@
 //! - 0x01: IPv6 (16 bytes)
 //! - 0x02: Domain (1 byte length + domain)
 
-mod socks_addr;
+pub(crate) mod socks_addr;
+#[cfg(not(feature = "relay-minimal"))]
 pub mod uot_common;
+#[cfg(not(feature = "relay-minimal"))]
 mod uot_v1_server_stream;
 
+#[cfg(not(feature = "relay-minimal"))]
 pub use uot_v1_server_stream::{SocksPacketAddrStream, UotV1ServerStream};
 
 /// UoT V2 connect mode stream - identical format to VlessMessageStream (length-prefixed u16be + data)
+#[cfg(not(feature = "relay-minimal"))]
 pub type UotV2Stream<S> = crate::vless::VlessMessageStream<S>;
 
 /// Magic address used to signal UoT V1 mode (multi-destination)

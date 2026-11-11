@@ -607,6 +607,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    #[cfg(not(feature = "relay-minimal"))]
     async fn remote_download_pem_paths_in_server_rules_and_overrides_are_embedded() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
@@ -844,6 +845,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(feature = "relay-minimal"))]
     async fn local_shadowtls_ca_paths_are_loaded_before_validation() {
         let dir = tempfile::tempdir().unwrap();
         let cert = rcgen::generate_simple_self_signed(vec!["proxy.test".into()]).unwrap();

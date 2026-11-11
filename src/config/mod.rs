@@ -27,7 +27,7 @@ pub(crate) mod resolved_visit;
 pub(crate) mod rule_visit;
 #[cfg(test)]
 pub(crate) mod test_support;
-#[cfg(test)]
+#[cfg(all(test, not(feature = "relay-minimal")))]
 mod tests;
 mod types;
 mod validate;

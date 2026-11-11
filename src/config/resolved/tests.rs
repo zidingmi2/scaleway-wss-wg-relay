@@ -117,6 +117,7 @@ fn resolved_choice_payloads_are_not_source_syntax() {
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn lowering_preserves_defined_validation_precedence() {
     let invalid_client = json!({"address":"192.0.2.1:443",
         "protocol":{"type":"tls","protocol":{"type":"direct"}}});
@@ -186,6 +187,7 @@ fn wireguard() -> Value {
 
 #[cfg(unix)]
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn catalog_only_carriers_obey_complete_client_node_and_depth_limits() {
     for depth_limit in [false, true] {
         for over_limit in [false, true] {
@@ -242,6 +244,7 @@ fn catalog_only_carriers_obey_complete_client_node_and_depth_limits() {
 
 #[cfg(unix)]
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn recursive_carriers_are_resolved_at_every_consumer_and_in_unused_catalog_leaves() {
     let certificate = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let client = wireguard();
@@ -324,6 +327,7 @@ fn recursive_carriers_are_resolved_at_every_consumer_and_in_unused_catalog_leave
 
 #[cfg(unix)]
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn invalid_wireguard_placement_and_settings_precede_hidden_references() {
     let client = wireguard();
     let mut invalid = client.clone();

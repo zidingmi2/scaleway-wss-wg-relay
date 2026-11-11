@@ -8,7 +8,9 @@ use futures::{FutureExt, StreamExt};
 use hickory_resolver::config::{ConnectionConfig, NameServerConfig, ProtocolConfig, ResolverOpts};
 use hickory_resolver::net::NetError;
 use hickory_resolver::net::xfer::{DnsExchange, DnsHandle, FirstAnswer};
-use hickory_resolver::proto::op::{DnsRequest, DnsRequestOptions, Message, MessageType, OpCode};
+use hickory_resolver::proto::op::{
+    DnsRequest, DnsRequestOptions, Message, MessageType, OpCode, ResponseCode,
+};
 use hickory_resolver::proto::rr::rdata::opt::EdnsCode;
 use hickory_resolver::{ConnectionProvider, PoolContext, TlsConfig};
 use tokio::sync::{Mutex, Semaphore};
@@ -42,6 +44,7 @@ pub(super) struct RawDnsExchange {
     provider: ProxyRuntimeProvider,
     context: PoolContext,
     admission: Semaphore,
+    cache: super::bounded_cache::ResponseCache,
 }
 
 impl fmt::Debug for RawDnsExchange {
@@ -79,6 +82,7 @@ impl RawDnsExchange {
                 },
             ),
             admission: Semaphore::new(64),
+            cache: Default::default(),
         }
     }
 
@@ -111,11 +115,74 @@ impl RawDnsExchange {
             ));
         }
         let id = request.metadata.id;
-        request.metadata.id = rand::random();
+        request.metadata.id = 0;
         if let Some(edns) = &mut request.edns {
             edns.set_max_payload(edns.max_payload().min(super::message::UDP_PAYLOAD_LIMIT));
             edns.options_mut().remove(EdnsCode::Cookie);
         }
+        let key = request.to_vec().map_err(io::Error::other)?;
+        let answer = if !cfg!(feature = "relay-minimal") || key.len() > 4096 {
+            // Unusual large EDNS queries remain supported, but do not occupy
+            // coalescing keys or the response cache.
+            self.query_uncached(&request, deadline).await?
+        } else if let Some(cached) = self.cache.get(&key) {
+            cached.message()?
+        } else {
+            let slot = self.cache.flight(&key)?;
+            let deadline = deadline.unwrap_or_else(|| {
+                tokio::time::Instant::now()
+                    + self.context.options.timeout.saturating_mul(
+                        self.context.options.attempts.max(1).min(u32::MAX as usize) as u32,
+                    )
+            });
+            let mut flight = tokio::time::timeout_at(deadline, slot.lock())
+                .await
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "DNS coalesced query deadline exceeded",
+                    )
+                })?;
+            if let Some(result) = flight.as_ref() {
+                match result {
+                    Ok(answer) => answer.message()?,
+                    Err(error) => return Err(copy_error(error)),
+                }
+            } else if let Some(cached) = self.cache.get(&key) {
+                *flight = Some(Ok(cached.clone()));
+                self.cache.finish_flight(&key, &slot);
+                cached.message()?
+            } else {
+                match self.query_uncached(&request, Some(deadline)).await {
+                    Ok(answer) => {
+                        let stored = super::bounded_cache::Answer::new(&answer)?;
+                        self.cache.insert(&key, stored.clone(), &answer);
+                        *flight = Some(Ok(stored));
+                        self.cache.finish_flight(&key, &slot);
+                        answer
+                    }
+                    Err(error) => {
+                        let error = Arc::new(error);
+                        *flight = Some(Err(error.clone()));
+                        self.cache.finish_flight(&key, &slot);
+                        return Err(copy_error(&error));
+                    }
+                }
+            }
+        };
+        let mut answer = answer;
+        answer.metadata.id = id;
+        answer.queries.clone_from(&request.queries);
+        answer.to_vec().map_err(io::Error::other)
+    }
+
+    async fn query_uncached(
+        &self,
+        request: &Message,
+        deadline: Option<tokio::time::Instant>,
+    ) -> io::Result<Message> {
+        let mut request = request.clone();
+        request.metadata.id = rand::random();
         let timeout = self
             .context
             .options
@@ -149,10 +216,7 @@ impl RawDnsExchange {
                 crate::resolver::DnsSetupPending,
             ));
         }
-        let mut answer = result?;
-        answer.metadata.id = id;
-        answer.queries.clone_from(&request.queries);
-        answer.to_vec().map_err(io::Error::other)
+        result
     }
 
     async fn exchange_inner(
@@ -162,7 +226,7 @@ impl RawDnsExchange {
         partial: &PartialAnswer,
     ) -> io::Result<Message> {
         let _permit = self.admission.acquire().await.map_err(io::Error::other)?;
-        let mut error = io::Error::new(io::ErrorKind::NotFound, "no real DNS upstreams configured");
+        let mut error = net_error(NetError::NoConnections);
         for _ in 0..self.context.options.attempts.max(1) {
             let upstreams: Vec<_> = self
                 .upstreams
@@ -193,9 +257,32 @@ impl RawDnsExchange {
             let mut answers = jobs.buffer_unordered(concurrency);
             while let Some(result) = answers.next().await {
                 match result {
-                    Ok(answer) => return Ok(answer),
+                    Ok(answer)
+                        if !cfg!(feature = "relay-minimal")
+                            || answer.metadata.response_code == ResponseCode::NoError =>
+                    {
+                        return Ok(answer);
+                    }
+                    Ok(answer) => {
+                        // A fast SERVFAIL/NXDOMAIN must not beat the other
+                        // configured resolver's valid positive response. Retain
+                        // it only if every candidate fails or reaches deadline.
+                        let mut retained = partial.lock();
+                        if retained.is_none()
+                            || answer.metadata.response_code == ResponseCode::NXDomain
+                        {
+                            *retained = Some(answer);
+                        }
+                    }
                     Err(failure) => error = failure,
                 }
+            }
+            // A definitive negative answer is a DNS result, not a failed
+            // transport to retry. All parallel candidates had their chance.
+            if let Some(answer) = partial.lock().as_ref()
+                && answer.metadata.response_code != ResponseCode::NoError
+            {
+                return Ok(answer.clone());
             }
         }
         Err(error)
@@ -302,6 +389,14 @@ impl RawDnsExchange {
             }
         }
         unreachable!()
+    }
+}
+
+fn copy_error(error: &io::Error) -> io::Error {
+    if crate::resolver::dns_setup_pending(error) {
+        io::Error::new(io::ErrorKind::TimedOut, crate::resolver::DnsSetupPending)
+    } else {
+        io::Error::new(error.kind(), error.to_string())
     }
 }
 

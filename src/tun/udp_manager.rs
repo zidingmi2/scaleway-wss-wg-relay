@@ -571,5 +571,6 @@ async fn destination_task(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "relay-minimal")))]
+#[path = "udp_manager/lifecycle_tests.rs"]
 mod lifecycle_tests;

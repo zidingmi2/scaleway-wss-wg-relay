@@ -599,7 +599,7 @@ pub fn protocol_type(protocol: &ResolvedClientProxyConfig) -> &str {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "relay-minimal")))]
 mod tests {
     use super::*;
 

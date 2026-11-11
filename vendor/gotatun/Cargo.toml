@@ -1,0 +1,85 @@
+[workspace]
+resolver = "2"
+members = ["gotatun", "gotatun-cli", "gotatun-crypto", "gotatun-packet"]
+
+[workspace.package]
+authors = [
+  "Noah Kennedy <nkennedy@cloudflare.com>",
+  "Andy Grover <agrover@cloudflare.com>",
+  "Jeff Hiner <jhiner@cloudflare.com>",
+  "Mullvad VPN",
+]
+edition = "2024"
+rust-version = "1.95"
+readme = "README.md"
+repository = "https://github.com/mullvad/gotatun"
+license = "MPL-2.0"
+
+[workspace.dependencies]
+aead = "0.5.2"
+aws-lc-rs = "1.16.2"
+base64 = "0.22.1"
+bitfield-struct = "0.12.1"
+blake2 = "0.10.6"
+bytes = "1.11.1"
+chacha20poly1305 = "0.10.1"
+clap = "3.1.6"
+constant_time_eq = "0.4.2"
+criterion = "0.7.0"
+daemonize = "0.5.0"
+duplicate = { version = "2.0.0", default-features = false }
+either = "1.15.0"
+etherparse = "0.13"
+eyre = "0.6.12"
+futures = "0.3.31"
+gotatun = { path = "./gotatun", version = "0.10.2", default-features = false }
+gotatun-crypto = { path = "gotatun-crypto" }
+gotatun-packet = { path = "gotatun-packet" }
+hex = "0.4.3"
+hmac = "0.12.1"
+ip_network = "0.4.1"
+ip_network_table = "0.2.0"
+ipnetwork = "0.21.1"
+libc = "0.2.180"
+maybenot = "2.2.2"
+mimalloc = { version = "0.1", default-features = false }
+mock_instant = "0.6"
+nix = { version = "0.31", default-features = false }
+parking_lot = "0.12.5"
+pcap-file = "2.0.0"
+portable-atomic = { version = "1", features = ["fallback"] }
+rand = "0.9.2"
+rand_chacha = "0.9.0"
+# We need this for x25519-dalek
+rand_core = "0.6.4"
+ring = "0.17.14"
+socket2 = "0.6.5"
+test-log = { version = "0.2.19", default-features = false, features = ["trace"] }
+thiserror = "1"
+tikv-jemallocator = { version = "0.6", default-features = false }
+tokio = "1.43.0"
+tokio-stream = "0.1.18"
+tracing = "0.1.40"
+tracing-appender = "0.2.1"
+tracing-subscriber = "0.3.9"
+tun = { version = "0.8.6", default-features = false }
+typed-builder = "0.21.0"
+windows-sys = { version = ">=0.60, <=0.61" }
+# NOTE: Must be same version that tun uses
+wintun-bindings = { version = "0.7.39", default-features = false }
+x25519-dalek = "2.0.1"
+zerocopy = "0.8.27"
+
+[profile.bench]
+lto = true  # Enable full link-time optimization.
+codegen-units = 1  # Use only 1 codegen-unit to enable full optimizations.
+
+[profile.release]
+lto = true  # Enable full link-time optimization.
+codegen-units = 1  # Use only 1 codegen-unit to enable full optimizations.
+
+# build with optimizations, but keep debug symbols
+[profile.release-debuginfo]
+inherits = "release"
+debug = true
+strip = false

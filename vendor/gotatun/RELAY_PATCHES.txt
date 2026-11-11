@@ -1,0 +1,15 @@
+Upstream: https://github.com/mullvad/gotatun
+Pinned commit: c06582e41022bcecbf33751631fd5a63d5794dc5
+License: Mozilla Public License 2.0; see LICENSE.
+
+Relay modifications:
+- DeviceBuilder::with_packet_capacity configures every device packet channel
+  and the reusable packet pool. Default remains 4000; values 1..=65536 are
+  accepted and validated before allocation. The relay selects 64.
+- Pool retention uses the configured packet count instead of VecDeque's
+  allocator-dependent capacity.
+- Deterministic unit tests cover bounds, retention, backpressure and cancellation.
+
+The capacity is a per-channel/retained-pool count, not a process memory limit.
+Packets currently in use, the bounded pre-handshake queue and transport buffers
+also consume memory. Cryptography and WireGuard wire protocol are unchanged.

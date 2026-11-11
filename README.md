@@ -1,4 +1,15 @@
-# shoes
+# Scaleway WSS / WireGuard relay
+
+This repository is a specialized Rust fork of Shoes v0.3.7. See
+[RELAY.md](RELAY.md) for the supported protocol subset, bounded-memory design,
+build instructions, offline verification and migration limits. Source and
+images contain no production credentials. This project does not automatically
+deploy itself, and offline test results are not public-network speed claims.
+
+The upstream project overview below is retained for attribution and reference;
+its full protocol list does not describe the `relay-minimal` build.
+
+## Upstream Shoes
 
 shoes is a high-performance multi-protocol proxy server written in Rust.
 

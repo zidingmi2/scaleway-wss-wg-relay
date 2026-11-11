@@ -75,6 +75,7 @@ pub(crate) fn build_client_proxy_chain_with_limits(
     for (index, config) in hops.iter().enumerate() {
         crate::sudoku_mask::validate_resolved_client(&config.protocol, &config.transport)?;
         config.validate_quic_key_exchange(index == 0)?;
+        #[cfg(not(feature = "relay-minimal"))]
         crate::quic_client::validate_resolved(config, index == 0)?;
     }
     let config = &hops[0];
@@ -110,6 +111,7 @@ pub(crate) fn build_client_proxy_chain_with_limits(
     let origins = hops.iter().map(|client| client.control.clone()).collect();
     let mut subsequent_hops = Vec::new();
     for (hop_index, config) in hops.into_iter().enumerate().skip(1) {
+        #[cfg(not(feature = "relay-minimal"))]
         if config.transport == crate::config::Transport::Quic
             && crate::xhttp::connector::contains(&config.protocol)
         {
@@ -243,6 +245,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn sudoku_mask_placement_is_checked_in_every_chain_hop_and_pool() {
         use serde_json::json;
         let mask = json!({"type":"sudoku_mask","protocol":{"type":"socks"}});
@@ -279,6 +282,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn offline_udp_capability_matches_wrappers_pools_and_runtime_handlers() {
         for (protocol, expected) in [
             ("{type: direct}", true),
@@ -313,6 +317,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn quic_allowlists_fail_before_ignored_transport_construction() {
         for groups in [None, Some("X25519MLKEM768"), Some("X25519")] {
             let field = groups
@@ -387,6 +392,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn test_build_single_proxy_hop() {
         let chain = build_client_proxy_chain(
             OneOrSome::One(ResolvedClientHop::Single(socks_config(1080))),
@@ -398,6 +404,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn test_build_direct_then_proxy_chain() {
         let chain = build_client_proxy_chain(
             OneOrSome::Some(vec![
@@ -413,6 +420,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn test_build_two_proxy_hops() {
         let chain = build_client_proxy_chain(
             OneOrSome::Some(vec![
@@ -427,6 +435,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn test_build_pool_at_hop0() {
         let chain = build_client_proxy_chain(
             OneOrSome::One(pool(vec![socks_config(1080), socks_config(1081)])),
@@ -445,6 +454,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn test_build_client_chain_group_with_chains() {
         let chains = NoneOrSome::Some(vec![
             ResolvedClientChain {
@@ -460,6 +470,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn test_direct_at_hop1_returns_error() {
         let result = try_build_client_proxy_chain(
             OneOrSome::Some(vec![

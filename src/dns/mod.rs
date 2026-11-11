@@ -7,11 +7,12 @@
 //! - DNS-over-TLS (DoT) - requires `hickory-tls` feature
 //! - DNS-over-HTTPS (DoH) - requires `hickory-https` feature
 //!
-//! TCP-based protocols (tcp://, tls://, https://) support routing through
-//! proxy chains via the ProxyRuntimeProvider.
+//! UDP and TCP-based protocols support routing through compatible proxy chains
+//! via ProxyRuntimeProvider. The minimal relay keeps one byte-bounded DNS cache.
 
 #[cfg(target_os = "linux")]
 mod bootstrap;
+mod bounded_cache;
 mod builder;
 mod composite_resolver;
 mod context;
@@ -23,6 +24,8 @@ mod hosts;
 mod message;
 mod parsed;
 mod proxy_runtime;
+#[cfg(all(test, feature = "relay-minimal"))]
+mod relay_tests;
 mod stream;
 mod system;
 #[allow(

@@ -41,8 +41,10 @@ impl QuicRetirements {
     }
 }
 
+#[cfg(not(feature = "relay-minimal"))]
 pub(crate) struct QuicListener(pub crate::quic_endpoint::QuicEndpoint);
 
+#[cfg(not(feature = "relay-minimal"))]
 impl QuicListener {
     pub fn bind_all(
         address: std::net::SocketAddr,
@@ -78,6 +80,7 @@ impl QuicListener {
     }
 }
 
+#[cfg(not(feature = "relay-minimal"))]
 impl std::ops::Deref for QuicListener {
     type Target = crate::quic_endpoint::QuicEndpoint;
 
@@ -86,6 +89,7 @@ impl std::ops::Deref for QuicListener {
     }
 }
 
+#[cfg(not(feature = "relay-minimal"))]
 impl Drop for QuicListener {
     fn drop(&mut self) {
         // Old reuse-port sockets must not keep serving a previous QUIC generation.
@@ -162,7 +166,7 @@ impl Drop for ListenerTasks {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "relay-minimal")))]
 mod tests {
     use super::*;
 

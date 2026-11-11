@@ -7,20 +7,21 @@ rust-version = "1.99.1"
 autotests = false
 autobenches = false
 license = "MIT"
-description = "A multi-protocol proxy server."
-homepage = "https://github.com/cfal/shoes/"
-repository = "https://github.com/cfal/shoes/"
+description = "Specialized Trojan/WebSocket to userspace WireGuard relay with bounded buffers."
+homepage = "https://github.com/zhimei33/scaleway-wss-wg-relay"
+repository = "https://github.com/zhimei33/scaleway-wss-wg-relay"
 readme = "README.md"
-keywords = ["proxy", "proxy-server", "shadowsocks", "v2ray", "vmess"]
+keywords = ["proxy", "wireguard", "trojan", "websocket", "serverless"]
 categories = ["command-line-utilities", "network-programming"]
 
 [workspace]
 members = ["tests/support"]
+exclude = ["vendor/gotatun", "vendor/smoltcp"]
 resolver = "3"
 
 [patch.crates-io]
 # Includes portable 64-bit atomics for MIPS32 and other targets without native support.
-gotatun = { git = "https://github.com/mullvad/gotatun", rev = "c06582e41022bcecbf33751631fd5a63d5794dc5" }
+gotatun = { path = "vendor/gotatun/gotatun" }
 # REALITY patches on stable rustls: reality/0.23.46-f04804fa1334. Pins the patched commit, not the branch.
 rustls = { git = "https://github.com/cfal/rustls", rev = "f1a23c187330386e9e7f14a21dbae368034dc430" }
 blake3 = { git = "https://github.com/cfal/BLAKE3", rev = "cd98c1c4112ed3b2cf2140e1844f266b3d665b53" }
@@ -34,27 +35,34 @@ hickory-resolver = { git = "https://github.com/cfal/hickory-dns", rev = "14df4ec
 # Includes nix-rust/nix#2821 for iOS socket feature compatibility.
 nix = { git = "https://github.com/nix-rust/nix", rev = "3eae6d68ec6382fef7b38cd58f97458e59a71af9" }
 # Preserves TCP ACK sequences during retransmission.
-smoltcp = { git = "https://github.com/cfal/smoltcp", rev = "7ef43e497f575cb0340a43e4f414f0f0b8760bf6" }
+smoltcp = { path = "vendor/smoltcp" }
 
 [lib]
 name = "shoes"
 # rlib = Rust library (for Rust dependencies)
 # cdylib = C dynamic library (.so on Linux/Android, .dylib on macOS)
 # staticlib = C static library (.a) - required for iOS
-crate-type = ["rlib", "cdylib", "staticlib"]
+crate-type = ["rlib"]
 
 [[bin]]
 name = "shoes"
 path = "src/main.rs"
 
 [features]
-default = []
+default = ["full"]
+relay-minimal = []
+full = ["dep:h3", "dep:h3-quinn", "dep:quinn", "dep:quinn-proto", "dep:instant-acme", "dep:notify", "dep:tun", "dep:rtnetlink", "hickory-resolver/h3-aws-lc-rs", "dep:blake2", "dep:digest", "dep:md-5", "dep:shake", "dep:ml-kem", "dep:rust-argon2", "dep:h2", "dep:http-body-util", "dep:hyper", "dep:hyper-util", "dep:hyper-tungstenite", "dep:mime_guess", "dep:sntpc"]
 ffi = []  # Enable FFI module for non-Android builds
 integration-tests = []
 optional-peer-tests = ["integration-tests"]
 external-network-tests = ["integration-tests"]
 privileged-tests = ["integration-tests"]
 stress-tests = ["integration-tests"]
+
+[[test]]
+name = "relay_acceptance"
+path = "tests/relay_acceptance.rs"
+required-features = ["relay-minimal"]
 
 [[test]]
 name = "process_contract"
@@ -127,50 +135,50 @@ anyhow = "1"
 async-trait = "*"
 aws-lc-rs = { version = "*", default-features = false }
 base64 = "*"
-blake2 = "0.11"
+blake2 = { version = "0.11", optional = true }
 blake3 = "*"
 bytes = "*"
 chrono = "*"
 dashmap = "*"
-digest = "*"
+digest = { version = "*", optional = true }
 etherparse = "*"
 futures = "*"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 ruzstd = "0.9.1"
 prost = "0.14.4"
 yaml-rust2 = { version = "0.13", default-features = false }
-h2 = "*"
-h3 = { version = "*", features = ["i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
-h3-quinn = "*"
-hickory-resolver = { version = "*", default-features = false, features = ["tokio", "tls-aws-lc-rs", "https-aws-lc-rs", "h3-aws-lc-rs"] }
+h2 = { version = "*", optional = true }
+h3 = { version = "*", features = ["i-implement-a-third-party-backend-and-opt-into-breaking-changes"] , optional = true }
+h3-quinn = { version = "*", optional = true }
+hickory-resolver = { version = "*", default-features = false, features = ["tokio", "tls-aws-lc-rs", "https-aws-lc-rs"] }
 http = "*"
 httpdate = "1"
-http-body-util = "*"
+http-body-util = { version = "*", optional = true }
 httparse = "*"
-hyper = { version = "*", features = ["client", "server", "http1", "http2"] }
-hyper-util = { version = "*", features = ["tokio", "server"] }
-hyper-tungstenite = "0.30.0"
+hyper = { version = "*", features = ["client", "server", "http1", "http2"] , optional = true }
+hyper-util = { version = "*", features = ["tokio", "server"] , optional = true }
+hyper-tungstenite = { version = "0.30.0", optional = true }
 memory-stats = "1.2.0"
 indexmap = "*"
-instant-acme = { version = "=0.8.5", default-features = false, features = ["aws-lc-rs", "rcgen", "time", "x509-parser"] }
+instant-acme = { version = "=0.8.5", default-features = false, features = ["aws-lc-rs", "rcgen", "time", "x509-parser"] , optional = true }
 ipnetwork = { version = "0.21", features = ["serde"] }
 libc = "*"
 log = { version = "*", features = ["std", "release_max_level_info"] }
 lru = "*"
-md-5 = "*"
+md-5 = { version = "*", optional = true }
 memchr = "*"
-mime_guess = "*"
-ml-kem = { version = "0.3.4", features = ["zeroize"] }
-notify = "*"
+mime_guess = { version = "*", optional = true }
+ml-kem = { version = "0.3.4", features = ["zeroize"] , optional = true }
+notify = { version = "*", optional = true }
 # 0.13's futex_time64 probe triggers SIGSYS on 32-bit Android API 26-29.
 parking_lot = "0.12.5"
 percent-encoding = "*"
-quinn = { version = "*", default-features = false, features = ["log", "runtime-tokio", "rustls-aws-lc-rs"] }
-quinn-proto = { version = "0.11", default-features = false }
+quinn = { version = "*", default-features = false, features = ["log", "runtime-tokio", "rustls-aws-lc-rs"] , optional = true }
+quinn-proto = { version = "0.11", default-features = false , optional = true }
 rand = "*"
 rand_core = "*"
 rcgen = { version = "*", default-features = false, features = ["aws_lc_rs", "pem"] }
-rust-argon2 = "*"
+rust-argon2 = { version = "*", optional = true }
 rustc-hash = "*"
 regex = { version = "1", default-features = false, features = ["std", "perf"] }
 regex-automata = { version = "0.4", default-features = false, features = ["std", "syntax", "meta", "perf"] }
@@ -178,10 +186,10 @@ rustls = "=0.23.46"
 serde = { version = "*", features = ["derive", "std"] }
 serde_json = { version = "*", features = ["preserve_order"] }
 serde_yaml = "*"
-shake = "*"
+shake = { version = "*", optional = true }
 smoltcp = { version = "*", default-features = false, features = ["std", "log", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-icmp", "auto-icmp-echo-reply", "socket-udp", "socket-tcp", "socket-tcp-cubic", "phy-tuntap_interface", "assembler-max-segment-count-32", "segmentation-offload"] }
 socket2 = { version = "*", features = ["all"] }
-sntpc = { version = "=0.11.0", default-features = false }
+sntpc = { version = "=0.11.0", default-features = false , optional = true }
 subtle = "*"
 tendns = { version = "0.2", default-features = false }
 tokio = { version = "*", features = [
@@ -197,7 +205,7 @@ tokio = { version = "*", features = [
 ] }
 tokio-util = { version = "*", features = ["time", "io", "rt"] }
 tracing = { version = "0.1", default-features = false, features = ["release_max_level_info"] }
-tun = { version = "*", features = ["async"] }
+tun = { version = "*", features = ["async"] , optional = true }
 url = "*"
 uuid = "1"
 webpki-roots = { version = "*" }
@@ -205,6 +213,7 @@ x509-parser = { version = "*", default-features = false, features = ["verify-aws
 zeroize = "*"
 
 [dev-dependencies]
+h2 = "*"
 tokio = { version = "*", features = ["test-util"] }
 rcgen = { version = "*", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
 shoes-test-support = { path = "tests/support" }
@@ -218,7 +227,7 @@ gotatun = { version = "*", default-features = false, features = ["device", "aws-
 portable-atomic = { version = "1", features = ["fallback"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-rtnetlink = "0.24"
+rtnetlink = { version = "0.24", optional = true }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 nftables = "0.6.3"
@@ -239,3 +248,4 @@ ndk-sys = "*"
 opt-level = 3
 lto = "fat"
 strip = true
+codegen-units = 1

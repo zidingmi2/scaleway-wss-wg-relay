@@ -822,7 +822,7 @@ fn apply_mask(bytes: &mut [u8], mask: &[u8; 4], offset: usize) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "relay-minimal")))]
 mod tests {
     use super::*;
     use crate::crypto::CryptoTlsStream;

@@ -642,6 +642,7 @@ fn test_rejects_unknown_field_in_rule_config_group() {
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn test_example_files_load_and_validate() {
     use crate::thread_util;
     use std::path::{Path, PathBuf};

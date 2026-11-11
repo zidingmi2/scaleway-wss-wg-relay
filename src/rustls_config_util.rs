@@ -6,7 +6,7 @@ use rustls::pki_types::pem::PemObject;
 
 use crate::config::TlsKeyExchangeGroups;
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "relay-minimal")))]
 mod hybrid_tests;
 
 pub fn try_create_client_config(
@@ -402,7 +402,7 @@ pub fn process_fingerprints(client_fingerprints: &[String]) -> std::io::Result<B
     Ok(result)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "relay-minimal")))]
 mod material_tests {
     use super::*;
     use std::io::{Read, Write};

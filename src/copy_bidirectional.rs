@@ -482,5 +482,5 @@ fn copy_buffer_size(requested: usize, writer: &(impl AsyncStream + ?Sized)) -> u
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "relay-minimal")))]
 pub(crate) mod tests;

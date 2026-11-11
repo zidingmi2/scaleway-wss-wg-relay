@@ -22,6 +22,7 @@ fn compile(value: Value, config_file: &Path) -> io::Result<crate::config::Valida
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn source_unions_inline_references_and_policy_order() {
     let dir = tempfile::tempdir().unwrap();
     write_domains(&dir.path().join("a.json"), "a.example");
@@ -74,6 +75,7 @@ fn source_unions_inline_references_and_policy_order() {
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn native_source_groups_compose_and_forward_reference_without_actions() {
     let dir = tempfile::tempdir().unwrap();
     let validated = compile(
@@ -122,6 +124,7 @@ fn native_source_groups_compose_and_forward_reference_without_actions() {
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn flat_sources_are_policy_shorthand_not_source_groups() {
     let dir = tempfile::tempdir().unwrap();
     write_domains(&dir.path().join("list.json"), "example.com");
@@ -150,6 +153,7 @@ fn flat_sources_are_policy_shorthand_not_source_groups() {
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn source_group_depth_is_order_independent_and_includes_callers() {
     for reversed in [false, true] {
         let mut groups: Vec<_> = (0..101)
@@ -190,6 +194,7 @@ fn source_group_depth_is_order_independent_and_includes_callers() {
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn source_group_work_budget_counts_repeated_references_and_caller_compositions() {
     let groups = |levels: usize| {
         let mut configs =
@@ -328,6 +333,7 @@ fn inline_and_named_sources_share_the_same_predicate() {
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn group_names_are_unique_and_cross_kind_references_fail() {
     let dir = tempfile::tempdir().unwrap();
     write_domains(&dir.path().join("a.json"), "a.example");
@@ -466,6 +472,7 @@ fn check_rule_locations(field: &str) {
 }
 
 #[test]
+#[cfg(not(feature = "relay-minimal"))]
 fn inline_sources_in_string_configs_require_absolute_paths() {
     let configs =
         serde_json::from_value(json!([server(json!([{"masks": {"path": "a.json"}}]))])).unwrap();
@@ -478,6 +485,7 @@ fn inline_sources_in_string_configs_require_absolute_paths() {
 }
 
 #[tokio::test]
+#[cfg(not(feature = "relay-minimal"))]
 async fn each_config_file_anchors_its_own_inline_and_group_sources() {
     let first = tempfile::tempdir().unwrap();
     let second = tempfile::tempdir().unwrap();

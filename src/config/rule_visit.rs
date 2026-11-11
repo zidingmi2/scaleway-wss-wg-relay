@@ -95,6 +95,7 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn generated_defaults_are_compiled_during_validation() {
         for rules in ["[]", "block-all", "allow-all-direct"] {
             let configs = serde_yaml::from_str(&format!(
@@ -120,6 +121,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn group_predicates_are_shared_before_listener_expansion() {
         let configs = serde_yaml::from_str(
             "\

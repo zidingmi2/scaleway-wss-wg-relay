@@ -251,14 +251,24 @@ impl UrlTestConfig {
                 "url-test interval must be 1..86400 seconds; timeout 1..60000 ms and no longer than interval",
             ));
         }
-        crate::control::probes::ProbeQuery::parse(
-            &std::collections::HashMap::from([
-                ("url".into(), self.url.clone()),
-                ("timeout".into(), self.timeout.to_string()),
-            ]),
-            true,
-        )?
-        .validate_automatic_target()
+        #[cfg(not(feature = "relay-minimal"))]
+        {
+            crate::control::probes::ProbeQuery::parse(
+                &std::collections::HashMap::from([
+                    ("url".into(), self.url.clone()),
+                    ("timeout".into(), self.timeout.to_string()),
+                ]),
+                true,
+            )?
+            .validate_automatic_target()
+        }
+        #[cfg(feature = "relay-minimal")]
+        {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "automatic probes excluded from relay-minimal",
+            ))
+        }
     }
 }
 
@@ -268,6 +278,7 @@ mod group_type_tests {
     use serde_json::json;
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn automatic_policy_errors_name_url_test() {
         let automatic = UrlTestConfig {
             url: "http://127.0.0.1/".into(),
@@ -285,6 +296,7 @@ mod group_type_tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn removed_fallback_type_and_health_check_are_rejected() {
         let base = json!({"client_group":"out", "type":"fallback", "client_proxies":["direct"]});
         let error = serde_json::from_value::<ClientConfigGroup>(base.clone()).unwrap_err();
@@ -328,6 +340,7 @@ mod group_type_tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn url_test_defaults_and_serialization_use_only_type() {
         let raw = json!({"client_group":"auto", "type":"url-test", "url":"http://probe.invalid/", "client_chains":["direct"]});
         let group: ClientConfigGroup = serde_json::from_value(raw).unwrap();

@@ -17,7 +17,7 @@ use parking_lot::Mutex;
 use smoltcp::storage::RingBuffer;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use super::wake::Wake;
+use super::{tcp_buffers::TcpBufferAllocation, wake::Wake};
 
 /// TCP socket state machine.
 ///
@@ -39,6 +39,8 @@ pub enum TcpSocketState {
 /// Shared between the async connection handle and the stack thread.
 pub struct TcpConnectionControl {
     inner: Mutex<TcpConnectionInner>,
+    // Drop the buffers in `inner` before returning their capacity permit.
+    _allocation: Option<Arc<TcpBufferAllocation>>,
 }
 
 struct TcpConnectionInner {
@@ -48,6 +50,9 @@ struct TcpConnectionInner {
     send_waker: Option<Waker>,
     /// Buffer for received data
     recv_buffer: RingBuffer<'static, u8>,
+    /// Monotonic bytes delivered from the socket to this bridge, independent
+    /// of how quickly the async reader drains its queue.
+    received_bytes: u64,
     /// Waker to notify when recv buffer has data
     recv_waker: Option<Waker>,
     /// Receive side state
@@ -65,12 +70,40 @@ impl TcpConnectionControl {
                 send_buffer: RingBuffer::new(vec![0u8; send_buffer_size]),
                 send_waker: None,
                 recv_buffer: RingBuffer::new(vec![0u8; recv_buffer_size]),
+                received_bytes: 0,
                 recv_waker: None,
                 recv_state: TcpSocketState::Normal,
                 send_state: TcpSocketState::Normal,
                 abandoned_at: None,
             }),
+            _allocation: None,
         }
+    }
+
+    pub(crate) fn with_buffer_allocation(mut self, allocation: Arc<TcpBufferAllocation>) -> Self {
+        self._allocation = Some(allocation);
+        self
+    }
+
+    pub(crate) fn buffer_usage(&self) -> (usize, usize) {
+        let inner = self.inner.lock();
+        (inner.recv_buffer.len(), inner.send_buffer.len())
+    }
+
+    pub(crate) fn receive_progress(&self) -> u64 {
+        self.inner.lock().received_bytes
+    }
+
+    pub(crate) fn try_grow_recv_buffer(&self, capacity: usize) -> bool {
+        self.inner.lock().recv_buffer.try_grow(capacity).is_ok()
+    }
+
+    pub(crate) fn try_grow_send_buffer(&self, capacity: usize) -> bool {
+        let grown = self.inner.lock().send_buffer.try_grow(capacity).is_ok();
+        if grown {
+            self.wake_sender();
+        }
+        grown
     }
 
     // --- Methods called by stack thread ---
@@ -98,7 +131,10 @@ impl TcpConnectionControl {
 
     /// Enqueue data into recv buffer. Returns bytes written.
     pub fn enqueue_recv_data(&self, data: &[u8]) -> usize {
-        self.inner.lock().recv_buffer.enqueue_slice(data)
+        let mut inner = self.inner.lock();
+        let count = inner.recv_buffer.enqueue_slice(data);
+        inner.received_bytes = inner.received_bytes.saturating_add(count as u64);
+        count
     }
 
     /// Check if send buffer is empty.
@@ -400,6 +436,33 @@ mod tests {
         let n = control.inner.lock().recv_buffer.dequeue_slice(&mut buf);
         assert_eq!(n, data.len());
         assert_eq!(&buf[..n], data);
+    }
+
+    #[test]
+    fn growing_bridge_buffers_preserves_wrapped_bytes_and_pending_writers() {
+        let control = TcpConnectionControl::new(1024, 1024);
+        let data: Vec<u8> = (0..1600).map(|i| (i % 251) as u8).collect();
+        {
+            let mut inner = control.inner.lock();
+            assert_eq!(inner.send_buffer.enqueue_slice(&data[..900]), 900);
+            let mut prefix = vec![0; 800];
+            assert_eq!(inner.send_buffer.dequeue_slice(&mut prefix), 800);
+            assert_eq!(prefix, data[..800]);
+            assert_eq!(inner.send_buffer.enqueue_slice(&data[900..]), 700);
+            inner.send_waker = Some(Waker::noop().clone());
+            assert_eq!(inner.recv_buffer.enqueue_slice(&data[..900]), 900);
+            assert_eq!(inner.recv_buffer.dequeue_slice(&mut prefix), 800);
+            assert_eq!(inner.recv_buffer.enqueue_slice(&data[900..]), 700);
+        }
+        assert!(control.try_grow_send_buffer(2048));
+        assert!(control.try_grow_recv_buffer(2048));
+        let mut inner = control.inner.lock();
+        assert!(inner.send_waker.is_none());
+        let mut tail = vec![0; 800];
+        assert_eq!(inner.send_buffer.dequeue_slice(&mut tail), 800);
+        assert_eq!(tail, data[800..]);
+        assert_eq!(inner.recv_buffer.dequeue_slice(&mut tail), 800);
+        assert_eq!(tail, data[800..]);
     }
 
     #[test]

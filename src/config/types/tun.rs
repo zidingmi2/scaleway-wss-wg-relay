@@ -52,6 +52,11 @@ impl Default for LinuxTunOptions {
 #[serde(default, deny_unknown_fields)]
 pub struct TunResourceLimits {
     pub tcp_buffer_size: usize,
+    /// Optional growth ceiling for each of the four userspace TCP buffers.
+    /// PacketStack reserves the initial allocation for every configured flow
+    /// before allowing established flows to consume the growth pool.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tcp_buffer_max_size: Option<usize>,
     pub tcp_memory_bytes: Option<usize>,
     pub max_tcp_connections: Option<usize>,
     pub max_udp_sessions: Option<usize>,
@@ -65,6 +70,7 @@ impl Default for TunResourceLimits {
     fn default() -> Self {
         Self {
             tcp_buffer_size: 32 * 1024,
+            tcp_buffer_max_size: None,
             tcp_memory_bytes: None,
             max_tcp_connections: None,
             max_udp_sessions: None,
@@ -91,6 +97,22 @@ impl TunResourceLimits {
                 std::io::ErrorKind::InvalidInput,
                 "invalid TUN resource limits",
             ));
+        }
+        if let Some(maximum) = self.tcp_buffer_max_size {
+            let base = self
+                .max_tcp_connections
+                .and_then(|count| count.checked_mul(4))
+                .and_then(|count| count.checked_mul(self.tcp_buffer_size));
+            if !(self.tcp_buffer_size..=16 * 1024 * 1024).contains(&maximum)
+                || base
+                    .zip(self.tcp_memory_bytes)
+                    .is_none_or(|(base, total)| base > total)
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "dynamic TCP buffers require an explicit connection cap and enough memory for all initial buffers",
+                ));
+            }
         }
         Ok(())
     }
@@ -155,6 +177,24 @@ mod tests {
         };
         limits.validate().unwrap();
         limits.max_udp_queued_bytes = Some(65534);
+        assert!(limits.validate().is_err());
+    }
+
+    #[test]
+    fn dynamic_tcp_growth_reserves_initial_capacity_for_all_connections() {
+        let mut limits = TunResourceLimits {
+            tcp_buffer_size: 32 * 1024,
+            tcp_buffer_max_size: Some(1024 * 1024),
+            tcp_memory_bytes: Some(32 * 1024 * 1024),
+            max_tcp_connections: Some(80),
+            ..Default::default()
+        };
+        limits.validate().unwrap();
+        assert_eq!(limits.tcp_connection_limit(), Some(80));
+        limits.tcp_memory_bytes = Some(80 * 4 * 32 * 1024 - 1);
+        assert!(limits.validate().is_err());
+        limits.tcp_memory_bytes = Some(32 * 1024 * 1024);
+        limits.max_tcp_connections = None;
         assert!(limits.validate().is_err());
     }
 }

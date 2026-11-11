@@ -181,6 +181,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn limits_round_trip_and_do_not_become_listeners() {
         let configs: Vec<Config> = serde_yaml::from_str(
             r#"- global_settings:
@@ -315,6 +316,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    #[cfg(not(feature = "relay-minimal"))]
     async fn settings_cache_directory_is_anchored_to_declaring_file_without_creating_it() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("config.yaml");

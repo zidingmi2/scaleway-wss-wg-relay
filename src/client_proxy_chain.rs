@@ -674,7 +674,7 @@ struct PrefixDialer {
     key: RouteKey,
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "relay-minimal")))]
 mod carrier_tests;
 
 #[async_trait::async_trait]
@@ -920,12 +920,12 @@ fn register_flow(
     context.register(network, target, path, &description.payload, info)
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "relay-minimal")))]
 mod tests;
 
 #[cfg(test)]
 #[path = "../benches/path_measurement.rs"]
 mod path_measurement;
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, target_os = "linux", not(feature = "relay-minimal")))]
 mod lifecycle_tests;

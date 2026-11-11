@@ -271,8 +271,8 @@ fn create_handler(
         ResolvedServerProxyConfig::Trojan {
             password,
             shadowsocks,
-        } => Box::new(TrojanTcpHandler::new_server(
-            &password,
+        } => Box::new(TrojanTcpHandler::new_server_with_passwords(
+            password.iter().map(String::as_str),
             &shadowsocks,
             client_proxy_selector.clone(),
             resolver.clone(),

@@ -238,6 +238,7 @@ pub(crate) fn quic_memory_exhausted(bytes: usize) -> std::io::Error {
     )
 }
 
+#[cfg(not(feature = "relay-minimal"))]
 pub(crate) fn configure_quic(
     config: &mut quinn::ServerConfig,
     bidi_streams: u32,
@@ -246,6 +247,7 @@ pub(crate) fn configure_quic(
     configure_quic_with_limits(config, bidi_streams, uni_streams, limits())
 }
 
+#[cfg(not(feature = "relay-minimal"))]
 pub(crate) fn configure_quic_with_limits(
     config: &mut quinn::ServerConfig,
     bidi_streams: u32,
@@ -276,10 +278,12 @@ pub(crate) fn configure_quic_with_limits(
 
 /// Returns the per-connection allowance from the same limits used to configure the windows.
 #[cfg(test)]
+#[cfg(not(feature = "relay-minimal"))]
 pub(crate) fn configure_quic_transport(transport: &mut quinn::TransportConfig) -> usize {
     configure_quic_transport_with_limits(transport, limits())
 }
 
+#[cfg(not(feature = "relay-minimal"))]
 pub(crate) fn configure_quic_transport_with_limits(
     transport: &mut quinn::TransportConfig,
     limits: GlobalLimits,

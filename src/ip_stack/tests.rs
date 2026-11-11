@@ -88,6 +88,49 @@ async fn tcp_half_close_preserves_reply_and_large_transfer() {
 }
 
 #[tokio::test]
+async fn dynamic_tcp_buffers_preserve_bidirectional_bytes_and_half_close() {
+    // Both peers are in-memory packet stacks. This exercises protocol and
+    // ownership transitions without opening a WireGuard or external socket.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let limits = TunResourceLimits {
+            tcp_buffer_size: 32 * 1024,
+            tcp_buffer_max_size: Some(1024 * 1024),
+            tcp_memory_bytes: Some(32 * 1024 * 1024),
+            max_tcp_connections: Some(80),
+            ..Default::default()
+        };
+        let mut client = PacketStack::new(
+            vec!["10.77.0.2".parse().unwrap()], 1280, false, limits.clone(),
+        ).unwrap();
+        let mut server = PacketStack::new(
+            vec!["10.77.0.1".parse().unwrap()], 1280, true, limits,
+        ).unwrap();
+        let mut tasks = bridge(&mut client, &mut server);
+        let mut incoming = server.tcp.take().unwrap();
+        let payload: Vec<u8> = (0..524_288).map(|i| (i % 251) as u8).collect();
+        let expected = payload.clone();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        tasks.spawn(async move {
+            let mut stream = incoming.recv().await.unwrap().connection;
+            let mut received = Vec::new();
+            stream.read_to_end(&mut received).await.unwrap();
+            assert_eq!(received, expected);
+            received.reverse();
+            stream.write_all(&received).await.unwrap();
+            stream.shutdown().await.unwrap();
+            let _ = done_tx.send(());
+        });
+        let mut stream = client.handle.connect("198.18.0.1:443".parse().unwrap()).await.unwrap();
+        stream.write_all(&payload).await.unwrap();
+        stream.shutdown().await.unwrap();
+        let mut reply = Vec::new();
+        stream.read_to_end(&mut reply).await.unwrap();
+        assert!(reply.iter().copied().eq(payload.iter().rev().copied()));
+        done_rx.await.unwrap();
+    }).await.unwrap();
+}
+
+#[tokio::test]
 async fn udp_empty_datagrams_boundaries_mtu_and_shutdown() {
     for (local, remote) in [("10.77.0.2", "10.77.0.1"), ("fd77::2", "fd77::1")] {
         tokio::time::timeout(Duration::from_secs(3), async {
@@ -107,13 +150,19 @@ async fn udp_empty_datagrams_boundaries_mtu_and_shutdown() {
                 write_udp(&mut reverse, data).await.unwrap();
                 assert_eq!(read_udp(&mut outbound).await.unwrap(), data);
             }
-            write_udp(&mut outbound, &[0; 1408]).await.unwrap();
-            assert_eq!(client.drops.load(std::sync::atomic::Ordering::Relaxed), 1);
+            if target.is_ipv4() {
+                write_udp(&mut outbound, &[0; 1408]).await.unwrap();
+                assert_eq!(read_udp(&mut reverse).await.unwrap(), vec![0; 1408]);
+            } else {
+                // IPv6 fragmentation is outside this IPv4 relay's contract.
+                assert!(write_udp(&mut outbound, &[0; 1408]).await.is_err());
+            }
+            assert_eq!(client.drops.load(std::sync::atomic::Ordering::Relaxed), 0);
             write_udp(&mut outbound, b"after oversize").await.unwrap();
             assert_eq!(read_udp(&mut reverse).await.unwrap(), b"after oversize");
             let permit = outbound.control.lock().budget.acquire(65535).unwrap();
             write_udp(&mut outbound, b"over budget").await.unwrap();
-            assert_eq!(client.drops.load(std::sync::atomic::Ordering::Relaxed), 2);
+            assert_eq!(client.drops.load(std::sync::atomic::Ordering::Relaxed), 1);
             drop(permit);
             write_udp(&mut outbound, b"after budget").await.unwrap();
             assert_eq!(read_udp(&mut reverse).await.unwrap(), b"after budget");
@@ -124,6 +173,34 @@ async fn udp_empty_datagrams_boundaries_mtu_and_shutdown() {
         .await
         .unwrap();
     }
+}
+
+#[tokio::test]
+async fn maximum_ipv4_udp_datagram_round_trips_through_bounded_stacks() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let limits = TunResourceLimits {
+            max_udp_sessions: Some(8),
+            max_udp_queued_bytes: Some(8 * 1024 * 1024),
+            ..Default::default()
+        };
+        let mut client = PacketStack::new(vec!["10.77.0.2".parse().unwrap()], 1280, false, limits.clone()).unwrap();
+        let mut server = PacketStack::new(vec!["10.77.0.1".parse().unwrap()], 1500, false, limits).unwrap();
+        let _bridge = bridge(&mut client, &mut server);
+        let mut forward = client.handle.open_udp("10.77.0.1:49152".parse().unwrap()).await.unwrap();
+        let mut reverse = server.handle.open_udp("10.77.0.2:49152".parse().unwrap()).await.unwrap();
+        let payload: Vec<u8> = (0..65507).map(|index| index as u8).collect();
+        write_udp(&mut forward, &payload).await.unwrap();
+        let mut bytes = vec![0; 65507];
+        let mut buffer = tokio::io::ReadBuf::new(&mut bytes);
+        futures::future::poll_fn(|cx| std::pin::Pin::new(&mut reverse).poll_read_message(cx, &mut buffer)).await.unwrap();
+        assert_eq!(buffer.filled(), payload);
+        write_udp(&mut reverse, &payload).await.unwrap();
+        buffer.clear();
+        futures::future::poll_fn(|cx| std::pin::Pin::new(&mut forward).poll_read_message(cx, &mut buffer)).await.unwrap();
+        assert_eq!(buffer.filled(), payload);
+        assert_eq!(client.drops.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(server.drops.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }).await.unwrap();
 }
 
 #[tokio::test]

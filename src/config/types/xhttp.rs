@@ -79,6 +79,7 @@ pub(crate) fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
+#[cfg(not(feature = "relay-minimal"))]
 fn validate_path_and_host(path: &str, host: Option<&str>) -> io::Result<()> {
     crate::xhttp::wire::Path::new(path)?;
     if let Some(host) = host.filter(|host| !host.is_empty()) {
@@ -86,6 +87,14 @@ fn validate_path_and_host(path: &str, host: Option<&str>) -> io::Result<()> {
             .map_err(io::Error::other)?;
     }
     Ok(())
+}
+
+#[cfg(feature = "relay-minimal")]
+fn validate_path_and_host(_path: &str, _host: Option<&str>) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "XHTTP is not included in relay-minimal",
+    ))
 }
 
 fn conflicts_with_framing(name: &http::HeaderName) -> bool {
@@ -651,7 +660,7 @@ pub(crate) fn validate_server_transport(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "relay-minimal")))]
 mod tests {
     use super::*;
 
@@ -1023,6 +1032,7 @@ mod tests {
         }
     }
 }
+#[cfg(not(feature = "relay-minimal"))]
 #[test]
 fn server_packet_size_must_fit_both_byte_budgets() {
     for mode in ["auto", "packet-up", "stream-up", "stream-one"] {

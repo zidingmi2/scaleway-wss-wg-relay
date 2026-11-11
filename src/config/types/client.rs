@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::address::NetLocation;
+#[cfg(not(feature = "relay-minimal"))]
 use crate::h2mux::{H2MuxOptions, MuxProtocol};
 use crate::option_util::{NoneOrOne, NoneOrSome};
 
@@ -39,6 +40,7 @@ pub struct H2MuxConfig {
     pub padding: bool,
 }
 
+#[cfg(not(feature = "relay-minimal"))]
 impl H2MuxConfig {
     /// Converts this config to H2MuxOptions for the client handler.
     pub fn to_options(&self) -> H2MuxOptions {

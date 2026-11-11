@@ -454,6 +454,7 @@ impl PreparedEndpoint {
             (udp, released, peers)
         };
         let mut device = DeviceBuilder::new()
+            .with_packet_capacity(64)
             .with_udp(udp)
             .with_private_key(StaticSecret::from(config.private_key.0))
             .with_peers(peers)
@@ -461,7 +462,6 @@ impl PreparedEndpoint {
                 io::IpSink {
                     sender: stack.input.clone(),
                     wake: stack.handle.wake.clone(),
-                    mtu: config.mtu,
                     drops: stack.drops.clone(),
                 },
                 io::IpSource {

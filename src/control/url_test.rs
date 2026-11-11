@@ -280,6 +280,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn every_selector_change_invalidates_all_groups_but_noops_preserve_samples() {
         use crate::control::selection::{SelectionOwner, SelectorDefinition};
         use std::sync::Arc;
@@ -329,6 +330,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    #[cfg(not(feature = "relay-minimal"))]
     async fn selection_health_tolerance_failure_recovery_and_staleness_are_url_scoped() {
         let groups = groups();
         let group = &groups.0["one"];
@@ -366,6 +368,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn peeking_with_different_eligibility_preserves_forwarding_incumbents() {
         let groups = groups();
         let group = &groups.0["one"];
@@ -390,6 +393,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    #[cfg(not(feature = "relay-minimal"))]
     async fn lazy_startup_probe_suppression_touch_and_rate_limited_recheck() {
         let groups = groups();
         let group = &groups.0["one"];

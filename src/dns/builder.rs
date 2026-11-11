@@ -667,14 +667,22 @@ fn server_to_ns_config(
             server_name,
             path,
         } => {
-            let protocol = ProtocolConfig::H3 {
-                server_name: server_name.clone(),
-                path: path.clone(),
-                disable_grease: true,
-            };
-            let mut cc = ConnectionConfig::new(protocol);
-            cc.port = addr.port();
-            Some((addr.ip(), cc))
+            #[cfg(feature = "relay-minimal")]
+            {
+                let _ = (addr, server_name, path);
+                None
+            }
+            #[cfg(not(feature = "relay-minimal"))]
+            {
+                let protocol = ProtocolConfig::H3 {
+                    server_name: server_name.clone(),
+                    path: path.clone(),
+                    disable_grease: true,
+                };
+                let mut cc = ConnectionConfig::new(protocol);
+                cc.port = addr.port();
+                Some((addr.ip(), cc))
+            }
         }
     }
 }

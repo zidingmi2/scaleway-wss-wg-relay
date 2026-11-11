@@ -1,6 +1,8 @@
 use super::{
     TCP_HANDSHAKE_TIMEOUT,
+    ipv4_fragments::Reassembler,
     packet::PacketBuffer,
+    tcp_buffers::{self, TcpBufferAllocation, TcpBufferPool},
     tcp_conn::{TcpConnection, TcpConnectionControl},
     udp::{UdpConnection, UdpControl},
     wake::{Wake, WakeReceiver},
@@ -94,11 +96,41 @@ pub(crate) struct AcceptedTcp {
     pub target: SocketAddr,
 }
 
+/// Releasing a bounded egress slot is work for the packet-stack thread, just
+/// like adding an ingress packet. Waking here covers WireGuard and in-memory
+/// consumers uniformly, without polling for free queue space.
+pub(crate) struct OutputReceiver {
+    inner: mpsc::Receiver<PacketBuffer>,
+    wake: Wake,
+}
+impl OutputReceiver {
+    pub(crate) async fn recv(&mut self) -> Option<PacketBuffer> {
+        let packet = self.inner.recv().await;
+        if packet.is_some() {
+            self.wake.notify();
+        }
+        packet
+    }
+    pub(crate) fn try_recv(&mut self) -> Result<PacketBuffer, mpsc::error::TryRecvError> {
+        let packet = self.inner.try_recv()?;
+        self.wake.notify();
+        Ok(packet)
+    }
+}
+impl Drop for OutputReceiver {
+    fn drop(&mut self) {
+        // Mark the channel closed before notifying, so the stack cannot observe
+        // an open channel and go back to sleep between notification and drop.
+        self.inner.close();
+        self.wake.notify();
+    }
+}
+
 pub(crate) struct PacketStack {
     thread: Option<thread::JoinHandle<()>>,
     pub handle: StackHandle,
     pub input: mpsc::Sender<PacketBuffer>,
-    pub output: Option<mpsc::Receiver<PacketBuffer>>,
+    pub output: Option<OutputReceiver>,
     pub tcp: Option<mpsc::Receiver<AcceptedTcp>>,
     pub udp: Option<mpsc::Receiver<PacketBuffer>>,
     pub replies: mpsc::Sender<PacketBuffer>,
@@ -139,6 +171,10 @@ impl PacketStack {
         let counts = Arc::new(FlowCounts::default());
         let (input, input_rx) = mpsc::channel(QUEUE_CAPACITY);
         let (output_tx, output) = mpsc::channel(QUEUE_CAPACITY);
+        let output = OutputReceiver {
+            inner: output,
+            wake: wake.clone(),
+        };
         let accept_capacity = limits
             .tcp_connection_limit()
             .map_or(QUEUE_CAPACITY, |limit| limit.max(QUEUE_CAPACITY));
@@ -208,14 +244,42 @@ struct QueueDevice {
     drops: Arc<AtomicU64>,
 }
 impl QueueDevice {
-    fn emit(&self, packet: PacketBuffer) {
-        if packet.len() > self.mtu || self.output.try_send(packet).is_err() {
+    /// Admit a complete datagram's fragment batch atomically. If the bounded
+    /// output queue is saturated, drop the whole datagram, never an arbitrary
+    /// suffix whose preceding fragments would pin receiver reassembly state.
+    fn emit_udp(&self, mut packet: PacketBuffer, budget: &Arc<Budget>) {
+        let result = (|| -> io::Result<()> {
+            if packet.lease().is_none() {
+                let ipv4 = packet.first().is_some_and(|byte| byte >> 4 == 4);
+                let charge =
+                    super::ipv4_fragments::output_reservation(packet.len(), ipv4, self.mtu)?
+                        .checked_add(packet.capacity().saturating_sub(packet.len()))
+                        .ok_or_else(|| io::Error::from(io::ErrorKind::OutOfMemory))?;
+                let permits = crate::udp_budget::reserve(budget, charge)
+                    .ok_or_else(|| io::Error::from(io::ErrorKind::OutOfMemory))?;
+                packet = packet.with_lease(Arc::new(permits));
+            }
+            let packets = super::ipv4_fragments::split(packet, self.mtu)?;
+            let permits = self
+                .output
+                .try_reserve_many(packets.len())
+                .map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
+            for (permit, packet) in permits.zip(packets) {
+                permit.send(packet);
+            }
+            Ok(())
+        })();
+        if result.is_err() {
             self.drops.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
 struct Rx(PacketBuffer);
-struct Tx<'a>(&'a QueueDevice);
+struct Tx<'a> {
+    permit: mpsc::Permit<'a, PacketBuffer>,
+    mtu: usize,
+    drops: &'a AtomicU64,
+}
 impl RxToken for Rx {
     fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
         f(&self.0)
@@ -226,7 +290,11 @@ impl TxToken for Tx<'_> {
         let mut packet = PacketBuffer::with_capacity(len);
         packet.resize(len);
         let result = f(&mut packet);
-        self.0.emit(packet);
+        if packet.len() > self.mtu {
+            self.drops.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.permit.send(packet);
+        }
         result
     }
 }
@@ -234,10 +302,28 @@ impl Device for QueueDevice {
     type RxToken<'a> = Rx;
     type TxToken<'a> = Tx<'a>;
     fn receive(&mut self, _: Instant) -> Option<(Rx, Tx<'_>)> {
-        Some((Rx(self.packet.take()?), Tx(self)))
+        self.packet.as_ref()?;
+        // Reserve a possible ACK/reset response before consuming the ingress
+        // packet. When full, leave the packet intact for the next wake.
+        let permit = self.output.try_reserve().ok()?;
+        Some((
+            Rx(self.packet.take().unwrap()),
+            Tx {
+                permit,
+                mtu: self.mtu,
+                drops: &self.drops,
+            },
+        ))
     }
     fn transmit(&mut self, _: Instant) -> Option<Tx<'_>> {
-        Some(Tx(self))
+        // smoltcp must not advance sequence/retransmission state unless the
+        // packet can actually enter the next stage.
+        let permit = self.output.try_reserve().ok()?;
+        Some(Tx {
+            permit,
+            mtu: self.mtu,
+            drops: &self.drops,
+        })
     }
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
@@ -249,6 +335,7 @@ impl Device for QueueDevice {
 
 struct TcpEntry {
     control: Arc<TcpConnectionControl>,
+    buffers: Option<Arc<TcpBufferAllocation>>,
     remote: SocketAddr,
     local: SocketAddr,
     outbound: bool,
@@ -280,7 +367,36 @@ impl TcpEntry {
             // Unlike OwnedPermit::send, try_send drops the connection if the receiver is gone.
             let _ = permit.release().try_send(connection);
         }
+        if self.established
+            && self.control.orphan_deadline().is_none()
+            && let Some(buffers) = &self.buffers
+        {
+            let sent = socket.send_queue();
+            buffers.grow_if_needed(tcp_buffers::SOCKET_SEND, sent, |capacity| {
+                socket.try_grow_send_buffer(capacity).is_ok()
+            });
+            let (received, sent) = self.control.buffer_usage();
+            buffers.grow_if_needed(tcp_buffers::BRIDGE_RECV, received, |capacity| {
+                self.control.try_grow_recv_buffer(capacity)
+            });
+            buffers.grow_if_needed(tcp_buffers::BRIDGE_SEND, sent, |capacity| {
+                self.control.try_grow_send_buffer(capacity)
+            });
+        }
         super::pump_tcp(handle, socket, &self.control, now);
+        if socket.state() == State::Established
+            && self.control.orphan_deadline().is_none()
+            && let Some(buffers) = &self.buffers
+        {
+            // Ingress often arrives one packet per wake. Use completed byte
+            // progress after pumping, not occupancy before the fast reader
+            // drains the queue, to grow the advertised receive window.
+            buffers.grow_for_progress(
+                tcp_buffers::SOCKET_RECV,
+                self.control.receive_progress(),
+                |capacity| socket.try_grow_recv_buffer(capacity).is_ok(),
+            );
+        }
     }
 }
 impl Drop for TcpEntry {
@@ -297,6 +413,21 @@ impl Drop for UdpEntry {
 
 fn now() -> Instant {
     std::time::Instant::now().into()
+}
+
+fn output_backpressure_delay(full: bool, delay: Option<Duration>) -> Option<Duration> {
+    if !full {
+        return delay;
+    }
+    // Pending TCP sends produce an immediate poll deadline. While egress is
+    // blocked, consumer notifications drive progress; this bounded maintenance
+    // tick only services lifecycle/fragment expiry, never a zero-delay spin.
+    let maintenance = Duration::from_secs(1);
+    Some(
+        delay
+            .filter(|delay| !delay.is_zero())
+            .map_or(maintenance, |delay| delay.min(maintenance)),
+    )
 }
 
 fn reconcile_tcp(
@@ -469,9 +600,20 @@ fn run(
     let mut sockets = SocketSet::new(vec![]);
     let mut tcp: HashMap<SocketHandle, TcpEntry> = HashMap::new();
     let mut udp: HashMap<SocketAddr, UdpEntry> = HashMap::new();
-    let budget = Arc::new(Budget::new(limits.max_udp_queued_bytes));
+    // The normal relay configuration has one shared 8 MiB UDP allowance. Reuse
+    // its counter rather than locking two identical budgets for every packet.
+    let budget = if limits.max_udp_queued_bytes == Some(crate::udp_budget::MAX_BYTES) {
+        crate::udp_budget::global()
+    } else {
+        Arc::new(Budget::new(limits.max_udp_queued_bytes))
+    };
+    let mut reassembler = Reassembler::new(budget.clone());
+    let tcp_buffers = TcpBufferPool::from_limits(&limits);
     let mut next_port = FIRST_EPHEMERAL_PORT;
     while running.load(Ordering::Acquire) {
+        if device.output.is_closed() {
+            break;
+        }
         if wake_rx.drain().is_err() {
             break;
         }
@@ -504,20 +646,36 @@ fn run(
                         let _ = result.send(Err(crate::resources::exhausted()));
                         continue;
                     }
+                    let buffers = if let Some(pool) = &tcp_buffers {
+                        let Some(buffers) = pool.admit() else {
+                            let _ = result.send(Err(crate::resources::exhausted()));
+                            continue;
+                        };
+                        Some(buffers)
+                    } else {
+                        None
+                    };
                     let mut socket = tcp_socket(limits.tcp_buffer_size);
+                    if let Some(buffers) = &buffers {
+                        // Window scaling is negotiated once, before the SYN.
+                        socket.set_recv_max_capacity(buffers.maximum()).unwrap();
+                    }
                     if socket.connect(iface.context(), target, local).is_err() {
                         let _ = result.send(Err(io::ErrorKind::InvalidInput.into()));
                         continue;
                     }
-                    let control = Arc::new(TcpConnectionControl::new(
-                        limits.tcp_buffer_size,
-                        limits.tcp_buffer_size,
-                    ));
+                    let mut control =
+                        TcpConnectionControl::new(limits.tcp_buffer_size, limits.tcp_buffer_size);
+                    if let Some(buffers) = &buffers {
+                        control = control.with_buffer_allocation(buffers.clone());
+                    }
+                    let control = Arc::new(control);
                     let connection = TcpConnection::new(control.clone(), wake.clone());
                     tcp.insert(
                         sockets.add(socket),
                         TcpEntry {
                             control,
+                            buffers,
                             remote: target,
                             local,
                             outbound: true,
@@ -570,18 +728,28 @@ fn run(
         let mut work = 0;
         iface.poll_maintenance(now());
         for _ in 0..QUEUE_CAPACITY {
-            let Ok(mut packet) = input.try_recv() else {
+            // Only this thread produces egress packets. Reserving a Tx token
+            // below cannot race another producer after this capacity check.
+            // Do not overwrite a pending TCP packet while awaiting capacity.
+            if device.output.capacity() == 0 || device.output.is_closed() {
+                break;
+            }
+            let Ok(packet) = input.try_recv() else {
                 break;
             };
             work += 1;
+            let mut packet = match reassembler.receive(packet, std::time::Instant::now()) {
+                Ok(Some(packet)) => packet,
+                Ok(None) => continue,
+                Err(_) => {
+                    device.drops.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+            };
             let Some(info) = packet_info(&packet) else {
                 device.drops.fetch_add(1, Ordering::Relaxed);
                 continue;
             };
-            if packet.len() > device.mtu {
-                device.drops.fetch_add(1, Ordering::Relaxed);
-                continue;
-            }
             packet.retain_range(0..info.length);
             if info.protocol == IpProtocol::Udp {
                 if let Some(entry) = udp.get(&info.target) {
@@ -623,7 +791,18 @@ fn run(
                 let Ok(permit) = accepted.clone().try_reserve_owned() else {
                     continue;
                 };
+                let buffers = if let Some(pool) = &tcp_buffers {
+                    let Some(buffers) = pool.admit() else {
+                        continue;
+                    };
+                    Some(buffers)
+                } else {
+                    None
+                };
                 let mut socket = tcp_socket(limits.tcp_buffer_size);
+                if let Some(buffers) = &buffers {
+                    socket.set_recv_max_capacity(buffers.maximum()).unwrap();
+                }
                 if socket.listen(info.target).is_err() {
                     continue;
                 }
@@ -635,10 +814,12 @@ fn run(
                     sockets.remove(handle);
                     continue;
                 }
-                let control = Arc::new(TcpConnectionControl::new(
-                    limits.tcp_buffer_size,
-                    limits.tcp_buffer_size,
-                ));
+                let mut control =
+                    TcpConnectionControl::new(limits.tcp_buffer_size, limits.tcp_buffer_size);
+                if let Some(buffers) = &buffers {
+                    control = control.with_buffer_allocation(buffers.clone());
+                }
+                let control = Arc::new(control);
                 let connection = TcpConnection::new(control.clone(), wake.clone());
                 let accepted_connection = AcceptedTcp {
                     connection,
@@ -649,6 +830,7 @@ fn run(
                     handle,
                     TcpEntry {
                         control,
+                        buffers,
                         remote: info.source,
                         local: info.target,
                         outbound: false,
@@ -682,7 +864,7 @@ fn run(
                 return false;
             }
             while let Some(datagram) = control.outgoing.pop_front() {
-                device.emit(datagram.packet);
+                device.emit_udp(datagram.packet, &budget);
             }
             if let Some(writer) = control.writer.take() {
                 writer.wake();
@@ -694,7 +876,7 @@ fn run(
                 break;
             };
             work += 1;
-            device.emit(packet);
+            device.emit_udp(packet, &budget);
         }
         for _ in 0..8 {
             if iface.poll_egress(now(), &mut device, &mut sockets)
@@ -708,7 +890,11 @@ fn run(
         if !running.load(Ordering::Acquire) {
             break;
         }
-        if work >= QUEUE_CAPACITY || !commands.is_empty() || local_work {
+        let output_full = device.output.capacity() == 0;
+        if device.output.is_closed() {
+            break;
+        }
+        if !commands.is_empty() || (!output_full && (work >= QUEUE_CAPACITY || local_work)) {
             continue;
         }
         let timestamp = now();
@@ -717,7 +903,15 @@ fn run(
             iface.poll_delay(timestamp, &sockets),
             tcp.values().map(|entry| &*entry.control),
         );
-        if let Err(error) = wake_rx.wait(-1, delay.map(Into::into))
+        let expired = reassembler.expire(std::time::Instant::now());
+        device.drops.fetch_add(expired as u64, Ordering::Relaxed);
+        let delay = delay
+            .map(Into::<Duration>::into)
+            .into_iter()
+            .chain(reassembler.next_delay(std::time::Instant::now()))
+            .min();
+        let delay = output_backpressure_delay(output_full, delay);
+        if let Err(error) = wake_rx.wait(-1, delay)
             && error.kind() != io::ErrorKind::Interrupted
         {
             break;

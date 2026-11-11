@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use aws_lc_rs::digest::SHA224;
+#[cfg(not(feature = "relay-minimal"))]
 use log::debug;
 use subtle::ConstantTimeEq;
 use tokio::io::AsyncWriteExt;
@@ -10,8 +11,15 @@ use crate::address::{Address, ResolvedLocation};
 use crate::async_stream::AsyncStream;
 use crate::client_proxy_selector::ClientProxySelector;
 use crate::config::ShadowsocksConfig;
+#[cfg(not(feature = "relay-minimal"))]
 use crate::h2mux::{MUX_DESTINATION_HOST, MUX_DESTINATION_PORT, handle_h2mux_session};
+#[cfg(feature = "relay-minimal")]
+const MUX_DESTINATION_HOST: &str = "sp.mux.sing-box.arpa";
+#[cfg(feature = "relay-minimal")]
+const MUX_DESTINATION_PORT: u16 = 444;
+use crate::prepend_stream::PrependStream;
 use crate::resolver::Resolver;
+#[cfg(not(feature = "relay-minimal"))]
 use crate::shadowsocks::{
     DefaultKey, ShadowsocksCipher, ShadowsocksKey, ShadowsocksStream, ShadowsocksStreamType,
 };
@@ -20,6 +28,7 @@ use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_handler::{
     TcpClientHandler, TcpClientSetupResult, TcpServerHandler, TcpServerSetupResult,
 };
+use crate::trojan_udp_stream::TrojanUdpStream;
 use crate::util::write_all;
 
 #[cfg(test)]
@@ -96,20 +105,38 @@ mod client_handshake_tests {
     }
 }
 
+#[cfg(not(feature = "relay-minimal"))]
 #[derive(Debug)]
 struct ShadowsocksData {
     cipher: ShadowsocksCipher,
     key: Arc<Box<dyn ShadowsocksKey>>,
 }
 
-#[derive(Debug)]
 pub struct TrojanTcpHandler {
     password_hash: Box<[u8]>,
+    additional_password_hashes: Vec<Box<[u8]>>,
+    #[cfg(not(feature = "relay-minimal"))]
     shadowsocks_data: Option<ShadowsocksData>,
     /// Proxy selector for server handler use. None when used as client handler.
     proxy_selector: Option<Arc<ClientProxySelector>>,
     /// DNS resolver for h2mux sessions. None when used as client handler.
+    #[cfg(not(feature = "relay-minimal"))]
     resolver: Option<Arc<dyn Resolver>>,
+}
+
+impl std::fmt::Debug for TrojanTcpHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut description = f.debug_struct("TrojanTcpHandler");
+        description
+            .field(
+                "credential_count",
+                &(1 + self.additional_password_hashes.len()),
+            )
+            .field("server", &self.proxy_selector.is_some());
+        #[cfg(not(feature = "relay-minimal"))]
+        description.field("shadowsocks", &self.shadowsocks_data.is_some());
+        description.finish_non_exhaustive()
+    }
 }
 
 impl TrojanTcpHandler {
@@ -128,6 +155,21 @@ impl TrojanTcpHandler {
         )
     }
 
+    /// Accept multiple server credentials without changing the single-password client interface.
+    /// Configuration validation rejects an empty list before this constructor is used.
+    pub fn new_server_with_passwords<'a>(
+        passwords: impl IntoIterator<Item = &'a str>,
+        shadowsocks_config: &Option<ShadowsocksConfig>,
+        proxy_selector: Arc<ClientProxySelector>,
+        resolver: Arc<dyn Resolver>,
+    ) -> Self {
+        let mut passwords = passwords.into_iter();
+        let first = passwords.next().expect("validated Trojan password list");
+        let mut handler = Self::new_server(first, shadowsocks_config, proxy_selector, resolver);
+        handler.additional_password_hashes = passwords.map(create_password_hash).collect();
+        handler
+    }
+
     /// Create a new handler for client use (no proxy_selector needed)
     pub fn new_client(password: &str, shadowsocks_config: &Option<ShadowsocksConfig>) -> Self {
         Self::new_inner(password, shadowsocks_config, None, None)
@@ -140,6 +182,7 @@ impl TrojanTcpHandler {
         resolver: Option<Arc<dyn Resolver>>,
     ) -> Self {
         let password_hash = create_password_hash(password);
+        #[cfg(not(feature = "relay-minimal"))]
         let shadowsocks_data = shadowsocks_config.as_ref().map(|config| match config {
             ShadowsocksConfig::Legacy {
                 cipher,
@@ -158,11 +201,16 @@ impl TrojanTcpHandler {
                 panic!("Trojan does not support shadowsocks 2022 ciphers (checked during config validation)")
             }
         });
+        #[cfg(feature = "relay-minimal")]
+        let _ = (shadowsocks_config, resolver);
 
         Self {
             password_hash,
+            additional_password_hashes: Vec::new(),
+            #[cfg(not(feature = "relay-minimal"))]
             shadowsocks_data,
             proxy_selector,
+            #[cfg(not(feature = "relay-minimal"))]
             resolver,
         }
     }
@@ -174,6 +222,7 @@ impl TcpServerHandler for TrojanTcpHandler {
         &self,
         mut server_stream: Box<dyn AsyncStream>,
     ) -> std::io::Result<TcpServerSetupResult> {
+        #[cfg(not(feature = "relay-minimal"))]
         if let Some(ShadowsocksData {
             ref cipher,
             ref key,
@@ -203,21 +252,18 @@ impl TcpServerHandler for TrojanTcpHandler {
             )));
         }
 
-        // Use constant-time comparison to prevent timing attacks
-        if self.password_hash.ct_eq(received_hash).unwrap_u8() == 0 {
+        // Check every precomputed credential, without exposing which identity matched in timing.
+        let mut authenticated = self.password_hash.ct_eq(received_hash);
+        for password_hash in &self.additional_password_hashes {
+            authenticated |= password_hash.ct_eq(received_hash);
+        }
+        if authenticated.unwrap_u8() == 0 {
             return Err(std::io::Error::other("Invalid password hash"));
         }
 
         let command_type = stream_reader.read_u8(&mut server_stream).await?;
 
-        if command_type == CMD_UDP_ASSOCIATE {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "UDP associate command is not supported",
-            ));
-        }
-
-        if command_type != CMD_CONNECT {
+        if command_type != CMD_CONNECT && command_type != CMD_UDP_ASSOCIATE {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!("Invalid command code: {command_type}"),
@@ -225,6 +271,13 @@ impl TcpServerHandler for TrojanTcpHandler {
         }
 
         let remote_location = read_location(&mut server_stream, &mut stream_reader).await?;
+        #[cfg(feature = "relay-minimal")]
+        if matches!(remote_location.address(), Address::Ipv6(_)) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "IPv6 is disabled for this relay",
+            ));
+        }
 
         let request_suffix = stream_reader.read_u16_be(&mut server_stream).await?;
         if request_suffix != 0x0d0a {
@@ -233,32 +286,55 @@ impl TcpServerHandler for TrojanTcpHandler {
             )));
         }
 
+        if command_type == CMD_UDP_ASSOCIATE {
+            // The request address is advisory. Each UDP frame supplies its own destination,
+            // which the shared UDP router resolves, checks, and pins before creating a flow.
+            let stream = PrependStream::new(server_stream, stream_reader.unparsed_data_owned());
+            return Ok(TcpServerSetupResult::MultiDirectionalUdp {
+                need_initial_flush: false,
+                stream: Box::new(TrojanUdpStream::new(stream)),
+                proxy_selector: self
+                    .proxy_selector
+                    .clone()
+                    .expect("proxy_selector required for server handler"),
+            });
+        }
+
         // Checks for h2mux magic destination
         if let Address::Hostname(host) = remote_location.address()
             && host == MUX_DESTINATION_HOST
             && remote_location.port() == MUX_DESTINATION_PORT
         {
-            let proxy_selector = self
-                .proxy_selector
-                .clone()
-                .expect("proxy_selector required for server handler");
-            let resolver = self.resolver.clone().expect("resolver required for h2mux");
+            #[cfg(feature = "relay-minimal")]
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "multiplexed Trojan sessions are disabled for this relay",
+            ));
 
-            let initial_data = stream_reader.unparsed_data_owned();
+            #[cfg(not(feature = "relay-minimal"))]
+            {
+                let proxy_selector = self
+                    .proxy_selector
+                    .clone()
+                    .expect("proxy_selector required for server handler");
+                let resolver = self.resolver.clone().expect("resolver required for h2mux");
 
-            return Ok(TcpServerSetupResult::Session(Box::pin(async move {
-                if let Err(e) = handle_h2mux_session(
-                    server_stream,
-                    initial_data,
-                    false,
-                    proxy_selector,
-                    resolver,
-                )
-                .await
-                {
-                    debug!("Trojan h2mux session ended: {}", e);
-                }
-            })));
+                let initial_data = stream_reader.unparsed_data_owned();
+
+                return Ok(TcpServerSetupResult::Session(Box::pin(async move {
+                    if let Err(e) = handle_h2mux_session(
+                        server_stream,
+                        initial_data,
+                        false,
+                        proxy_selector,
+                        resolver,
+                    )
+                    .await
+                    {
+                        debug!("Trojan h2mux session ended: {}", e);
+                    }
+                })));
+            }
         }
 
         Ok(TcpServerSetupResult::TcpForward {
@@ -285,6 +361,7 @@ impl TcpClientHandler for TrojanTcpHandler {
         mut client_stream: Box<dyn AsyncStream>,
         remote_location: ResolvedLocation,
     ) -> std::io::Result<TcpClientSetupResult> {
+        #[cfg(not(feature = "relay-minimal"))]
         if let Some(ShadowsocksData {
             ref cipher,
             ref key,
@@ -415,13 +492,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn both_server_credentials_authenticate_without_exposing_hashes() {
+        let handler = TrojanTcpHandler::new_server_with_passwords(
+            ["owner-secret", "wg-owner-secret"],
+            &None,
+            Arc::new(ClientProxySelector::new(vec![])),
+            Arc::new(NativeResolver::new()),
+        );
+        let description = format!("{handler:?}");
+        for password in ["owner-secret", "wg-owner-secret", "invalid-secret"] {
+            let hash = create_password_hash(password);
+            assert!(!description.contains(password));
+            assert!(!description.contains(std::str::from_utf8(&hash).unwrap()));
+            let mut bytes = hash.into_vec();
+            bytes.extend_from_slice(b"\r\n\x01\x01\xc0\x00\x02\x01\x01\xbb\r\n");
+            let (mut client, server) = tokio::io::duplex(1024);
+            client.write_all(&bytes).await.unwrap();
+            client.shutdown().await.unwrap();
+            let result = handler.setup_server_stream(Box::new(server)).await;
+            assert_eq!(result.is_ok(), password != "invalid-secret");
+        }
+    }
+
+    #[tokio::test]
+    async fn udp_association_preserves_coalesced_frames_and_routes_each_target() {
+        let location = NetLocation::from_str("0.0.0.0:0", None).unwrap();
+        let mut bytes = request(&location);
+        bytes[58] = CMD_UDP_ASSOCIATE;
+        bytes.extend_from_slice(b"\x01\xc0\x00\x02\x01\x00\x35\x00\x03\r\none");
+        bytes.extend_from_slice(b"\x03\x0bexample.com\x01\xbb\x00\x03\r\ntwo");
+        let (mut client, server) = tokio::io::duplex(1024);
+        client.write_all(&bytes).await.unwrap();
+        client.shutdown().await.unwrap();
+        let TcpServerSetupResult::MultiDirectionalUdp {
+            mut stream,
+            need_initial_flush,
+            ..
+        } = handler()
+            .setup_server_stream(Box::new(server))
+            .await
+            .unwrap()
+        else {
+            panic!("expected per-destination UDP routing");
+        };
+        assert!(!need_initial_flush);
+        for (destination, payload) in [("192.0.2.1:53", b"one"), ("example.com:443", b"two")] {
+            let mut bytes = [0; 3];
+            let mut output = tokio::io::ReadBuf::new(&mut bytes);
+            let target = std::future::poll_fn(|cx| {
+                std::pin::Pin::new(&mut *stream).poll_read_targeted_message(cx, &mut output)
+            })
+            .await
+            .unwrap();
+            assert_eq!(target, NetLocation::from_str(destination, None).unwrap());
+            assert_eq!(output.filled(), payload);
+        }
+    }
+
+    #[tokio::test]
     async fn malformed_requests_never_produce_forwarding_work() {
         let valid = request(&NetLocation::from_str("example.com:443", None).unwrap());
         let mut cases = vec![(b"short\r\n".to_vec(), ErrorKind::Other)];
         let mut wrong_hash = valid.clone();
         wrong_hash[0] = b'0';
         cases.push((wrong_hash, ErrorKind::Other));
-        for command in [CMD_UDP_ASSOCIATE, 0xff] {
+        for command in [0x00, 0xff] {
             let mut request = valid.clone();
             request[58] = command;
             cases.push((request, ErrorKind::InvalidInput));
@@ -449,6 +584,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "relay-minimal"))]
     #[tokio::test]
     async fn dropping_unpolled_mux_session_releases_transport() {
         let location = NetLocation::new(

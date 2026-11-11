@@ -64,6 +64,7 @@ mod tests {
     use crate::config::{Config, create_server_configs};
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn ntp_is_opt_in_and_round_trips_through_both_global_names() {
         for name in ["global_settings", "global_limits"] {
             for fields in ["{}", "{ntp: null}"] {
@@ -90,6 +91,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "relay-minimal"))]
     fn ntp_rejects_invalid_config_without_network_access() {
         for fields in [
             "{}",

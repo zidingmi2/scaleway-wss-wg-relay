@@ -167,5 +167,5 @@ impl PreparedTcp {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "relay-minimal")))]
 pub(crate) mod tests;

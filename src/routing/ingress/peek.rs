@@ -114,7 +114,7 @@ impl<S: AsyncMessageStream> AsyncMessageStream for PeekMessageStream<S> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "relay-minimal")))]
 mod tests {
     use super::*;
     use crate::rules::Protocol;
