@@ -1230,6 +1230,7 @@ async fn test_plan_group_pools_equivalent_specs_with_distinct_runtime_objects() 
 
 #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
 #[tokio::test]
+#[cfg(not(feature = "relay-minimal"))]
 async fn selector_identity_prevents_dns_pooling_of_identical_members() {
     let configs = serde_yaml::from_str(
         r#"
