@@ -1,8 +1,11 @@
 # syntax=docker/dockerfile:1
-FROM rust:1.99.1-bookworm AS build-base
+FROM rust:1.99.1-bookworm@sha256:e6f2cff35d0f309acf8433b4f05878ed77092602c5065cc81801177da0bb3a9c AS build-base
 RUN apt-get update && apt-get install -y --no-install-recommends cmake && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 ENV CARGO_BUILD_JOBS=2 \
+    CARGO_NET_GIT_FETCH_WITH_CLI=true \
+    CARGO_HTTP_MULTIPLEXING=false \
+    CARGO_HTTP_TIMEOUT=180 \
     JEMALLOC_SYS_WITH_MALLOC_CONF="narenas:1,background_thread:false,dirty_decay_ms:1000,muzzy_decay_ms:0" \
     RUSTFLAGS="-C target-cpu=x86-64"
 COPY Cargo.toml Cargo.lock build.rs rust-toolchain.toml ./
@@ -38,7 +41,7 @@ CMD ["cargo", "test", "--offline", "--locked", "--no-default-features", "--featu
 FROM application AS release-build
 RUN cargo build --locked --release --no-default-features --features relay-minimal --bin shoes --bin relay-config
 
-FROM debian:bookworm-slim AS runtime
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=release-build /build/target/release/shoes /usr/local/bin/shoes
 COPY --from=release-build /build/target/release/relay-config /usr/local/bin/relay-config
