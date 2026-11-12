@@ -105,16 +105,31 @@ and incorporates work copyright Cloudflare, Inc. Its source files are covered
 by the Mozilla Public License 2.0 and the notices reproduced in
 `licenses/MPL-2.0.txt` and `licenses/gotatun-CLOUDFLARE.txt`.
 
-The unmodified corresponding source is available at:
+The unmodified upstream baseline is available at:
 
 - https://github.com/mullvad/gotatun/tree/c06582e41022bcecbf33751631fd5a63d5794dc5
 - https://github.com/mullvad/gotatun/archive/c06582e41022bcecbf33751631fd5a63d5794dc5.tar.gz
 
-Recipients may obtain, modify, and redistribute the covered source under the
-MPL 2.0. Shoes does not modify GotaTun's source. Shoes' own source remains under
-its existing MIT license. Distributors of modified GotaTun builds must also
-provide the corresponding modified covered source and retain these notices.
-Embedding a Shoes static or dynamic library does not remove these obligations.
+This relay fork modifies GotaTun to make packet-pool and channel capacity
+configurable and to bound retained packet buffers. The complete modified
+corresponding source, original licenses, and patch notes are included in
+`vendor/gotatun` and published at:
+
+- https://github.com/zidingmi2/scaleway-wss-wg-relay/tree/main/vendor/gotatun
+- https://github.com/zidingmi2/scaleway-wss-wg-relay/blob/main/vendor/gotatun/RELAY_PATCHES.txt
+
+For an immutable container image, replace `main` in those URLs with the commit
+recorded in its `org.opencontainers.image.revision` label. Recipients may obtain,
+modify, and redistribute the covered source under MPL 2.0. Shoes' own source
+remains under its existing MIT license. Distributors must retain these notices
+and provide the corresponding modified covered source. Embedding a Shoes static
+or dynamic library does not remove these obligations.
+
+This fork also modifies the pinned smoltcp TCP implementation to support bounded
+buffer growth and receive-window scaling. Its complete source and 0BSD license
+are included in `vendor/smoltcp`:
+
+- https://github.com/zidingmi2/scaleway-wss-wg-relay/tree/main/vendor/smoltcp
 
 These source-availability details supplement the reproduced dependency licenses.
 
