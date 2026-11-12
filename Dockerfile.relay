@@ -6,6 +6,9 @@ RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.l
     rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 ENV CARGO_BUILD_JOBS=2 \
+    CARGO_INCREMENTAL=0 \
+    CARGO_PROFILE_DEV_DEBUG=0 \
+    CARGO_PROFILE_TEST_DEBUG=0 \
     CARGO_NET_GIT_FETCH_WITH_CLI=true \
     CARGO_HTTP_MULTIPLEXING=false \
     CARGO_HTTP_TIMEOUT=180 \
