@@ -55,15 +55,74 @@ be passed directly to this Rust program.
 
 ## Resource model
 
-TCP begins with four 32 KiB buffers per flow, with a maximum of 1 MiB per buffer.
-A 32 MiB aggregate capacity budget preserves 10 MiB of base admission for
-80 flows. Growth accounts for both old and replacement allocations, preserves
-window scaling and out-of-order data, and never shrinks a live receive window.
+TCP begins with four 32 KiB buffers per flow, with a maximum of 4 MiB per buffer.
+A 48 MiB aggregate capacity budget preserves 10 MiB of base admission for
+80 flows. Growth is tiered: buffers below 512 KiB quadruple per round, larger
+ones double, so a slow-start flow reaches the 4 MiB maximum in five
+reallocations instead of eight. Growth accounts for both old and replacement
+allocations, preserves window scaling and out-of-order data, and never shrinks
+a live receive window.
 
 UDP allocations share an 8 MiB budget. IPv4 reassembly is further limited to
 32 incomplete datagrams, 2 MiB and 15 seconds. GotaTun packet pools and internal
-channels are set to 64 entries. These limits describe controlled allocations,
-not a hard bound on total process RSS or a throughput guarantee.
+channels are set to 64 entries. The WireGuard carrier requests 4 MiB kernel
+socket buffers and coalesces its traffic: up to 64 encrypted packets leave in
+one `sendmmsg` syscall with a readiness-managed per-packet fallback, and a
+receive takes one readiness-managed datagram plus a synchronous `recvmmsg`
+drain of at most 64 packets per call into eight reusable 64 KiB scratch slots,
+so large datagrams are never truncated at the 4 KiB packet pool. The detour
+(proxy-chain) transport intentionally stays on the single-packet path. These
+limits describe controlled allocations, not a hard bound on total process RSS
+or a throughput guarantee.
+
+The 100 mVCPU CFS quota can stall any single task for tens of milliseconds at
+a time; the carrier batch sizes and 4 MiB socket buffers absorb such stalls
+instead of dropping authenticated traffic while the CPU budget is exhausted.
+
+Packets reaching the IP-stack classifier have already been authenticated by
+WireGuard's AEAD layer, so that path skips the IP/TCP checksum verification.
+Checksums are still checked where integrity is not yet established (IPv4
+fragment reassembly), and the stack's TCP sockets keep validating according to
+their checksum capabilities. The IP-stack device additionally advertises
+receive-side checksum offload to smoltcp: every packet entering the device has
+already been AEAD-authenticated and was checksum-validated by the peer's
+kernel before entering the tunnel, so the software RX add-loops are skipped in
+both directions of a flow. Transmit-side computation stays enabled because
+emitted packets leave the tunnel to real hosts and no hardware computes them.
+
+TCP congestion control and retransmission behavior carry three deliberate fork
+deviations in the vendored smoltcp, each documented at its constant: the
+initial congestion window is ten segments (RFC 6928) instead of two, applied
+when the real MSS becomes known at handshake time and never reducing a
+post-loss window; the retransmission timeout floor is 300 ms instead of the
+RFC 6298 1 second, because the tunnel's roughly 300 ms RTT made every loss
+wait at least three RTTs before recovering; and socket egress drains until
+smoltcp reports quiescence instead of a fixed eight rounds, so a burst fills
+the output channel in one wake. Socket egress packet coalescing stops at the
+output channel's backpressure exactly as before.
+
+Outbound UDP flows are reaped by the stack thread after 120 idle seconds with
+no pending datagrams, so abandoned DNS or UDP sessions cannot accumulate for
+the process lifetime on the 128 MB host; a reaped flow surfaces as the usual
+BrokenPipe on next use, and pooled DNS connections re-establish transparently.
+
+The WireGuard endpoint completes one peer handshake at startup before serving
+(capped at ten seconds, best effort), so a cold start or scale-up no longer
+pays the handshake round trip on the first user connection; the on-demand
+handshake remains the fallback when the warm-up fails.
+
+Relay chunk buffers are 32 KiB per direction and the WebSocket packing buffer
+is 64 KiB, so bulk flows emit one 32 KiB frame per write instead of 16 KiB
+frames, halving frame and downstream write syscall counts; interactive traffic
+still flushes as soon as both sides are pending.
+
+DNS response caches survive idle-transport rebuilds for up to one hour
+(previously sixty seconds), and a UDP upstream whose exchange times out or
+fails at the transport level retries the same endpoint over its configured TCP
+companion within the same slot before the overall deadline: over the tunnel a
+silently dropped UDP datagram is the normal failure mode, and no ICMP feedback
+ever reaches the container. Definitive DNS answers are never retried over TCP;
+they are handled by the exchange-level partial logic.
 
 The expected host resource specification remains 100 mVCPU / 128 MB with
 minimum replicas 0 and maximum replicas 1. Language changes do not alter the

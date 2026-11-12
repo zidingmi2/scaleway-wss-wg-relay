@@ -288,6 +288,35 @@ impl RawDnsExchange {
         Err(error)
     }
 
+    /// The explicitly configured TCP companion of a UDP upstream, if any.
+    /// Includes system-discovered UDP+TCP pairs.
+    fn tcp_companion(&self, upstream: &Upstream) -> Option<&Upstream> {
+        self.upstreams.iter().find(|candidate| {
+            candidate.same_endpoint(upstream)
+                && matches!(candidate.config.protocol, ProtocolConfig::Tcp)
+        })
+    }
+
+    /// One bounded attempt of a UDP upstream's TCP companion. Any failure
+    /// (deadline or transport) is reported as Err; the caller decides whether
+    /// to surface its own original UDP error instead.
+    async fn try_tcp_companion(
+        &self,
+        tcp: &Upstream,
+        request: &Message,
+        setups: &SetupWaits,
+        budget: std::time::Duration,
+    ) -> io::Result<Message> {
+        tokio::time::timeout(budget, self.send_upstream(tcp, request.clone(), setups))
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "DNS TCP companion deadline exceeded",
+                )
+            })?
+    }
+
     fn upstream_job<'a>(
         &'a self,
         upstream: &'a Upstream,
@@ -297,17 +326,68 @@ impl RawDnsExchange {
         partial: &'a PartialAnswer,
     ) -> BoxFuture<'a, io::Result<Message>> {
         Box::pin(async move {
-            tokio::time::timeout(
-                timeout,
+            // A UDP upstream with a same-endpoint TCP companion reserves part of
+            // its slot for that companion. A silently dropped UDP datagram is the
+            // normal failure mode over the WireGuard tunnel, where no ICMP
+            // feedback reaches the container; without the reservation the TCP
+            // retry would start after the whole upstream deadline had elapsed.
+            let companion = if matches!(upstream.config.protocol, ProtocolConfig::Udp) {
+                self.tcp_companion(upstream)
+            } else {
+                None
+            };
+            let Some(tcp) = companion else {
+                return tokio::time::timeout(
+                    timeout,
+                    self.send(upstream, request.clone(), setups, partial),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "DNS upstream deadline exceeded",
+                    ))
+                });
+            };
+            // Strictly proportional split: the pair always stays within the
+            // slot the wave scheduler granted, whatever its absolute size.
+            let udp_budget = timeout.mul_f64(0.6);
+            let tcp_budget = timeout.saturating_sub(udp_budget);
+            let udp_result = tokio::time::timeout(
+                udp_budget,
                 self.send(upstream, request.clone(), setups, partial),
             )
-            .await
-            .unwrap_or_else(|_| {
-                Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "DNS upstream deadline exceeded",
-                ))
-            })
+            .await;
+            match udp_result {
+                Ok(Ok(answer)) => Ok(answer),
+                Ok(Err(error)) => {
+                    if !is_transport_failure(&error) {
+                        return Err(error);
+                    }
+                    if let Ok(answer) =
+                        self.try_tcp_companion(tcp, request, setups, tcp_budget).await
+                    {
+                        check_answer(&answer, request)?;
+                        return Ok(answer);
+                    }
+                    // The original UDP error keeps transport semantics that
+                    // upstream refresh and retry logic reason about.
+                    Err(error)
+                }
+                Err(_udp_elapsed) => {
+                    let udp_error = io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "DNS upstream deadline exceeded",
+                    );
+                    if let Ok(answer) =
+                        self.try_tcp_companion(tcp, request, setups, tcp_budget).await
+                    {
+                        check_answer(&answer, request)?;
+                        return Ok(answer);
+                    }
+                    Err(udp_error)
+                }
+            }
         })
     }
 
@@ -323,11 +403,7 @@ impl RawDnsExchange {
             .await?;
         check_answer(&answer, &message)?;
         if answer.metadata.truncation && matches!(upstream.config.protocol, ProtocolConfig::Udp) {
-            // Only use explicitly configured TCP, including system-discovered UDP+TCP pairs.
-            if let Some(tcp) = self.upstreams.iter().find(|candidate| {
-                candidate.same_endpoint(upstream)
-                    && matches!(candidate.config.protocol, ProtocolConfig::Tcp)
-            }) {
+            if let Some(tcp) = self.tcp_companion(upstream) {
                 partial.lock().get_or_insert_with(|| answer.clone());
                 let answer = self.send_upstream(tcp, message.clone(), setups).await?;
                 check_answer(&answer, &message)?;
@@ -460,6 +536,25 @@ pub(super) fn net_error(error: NetError) -> io::Error {
         _ => io::ErrorKind::Other,
     };
     io::Error::new(kind, error)
+}
+
+/// Transport-level DNS failures that justify retrying a UDP upstream over its
+/// TCP companion. Definitive DNS results (failure codes, shape mismatches) are
+/// deliberately excluded: they are answers, not transport breakage, and the
+/// exchange-level partial logic already handles them.
+fn is_transport_failure(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::TimedOut
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::HostUnreachable
+    )
 }
 
 #[cfg(test)]

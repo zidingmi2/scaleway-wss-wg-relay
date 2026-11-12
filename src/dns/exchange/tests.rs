@@ -332,7 +332,7 @@ async fn udp_only_configuration_returns_truncation_without_new_transport() {
 }
 
 #[tokio::test]
-async fn separately_configured_tcp_remains_a_primary_when_udp_is_silent() {
+async fn tcp_companion_falls_back_when_udp_is_silent() {
     for system_pair in [true, false] {
         let (tcp, udp) = crate::dns::bind_tcp_and_udp().await;
         let address = udp.local_addr().unwrap();
@@ -356,29 +356,20 @@ async fn separately_configured_tcp_remains_a_primary_when_udp_is_silent() {
         options.timeout = Duration::from_millis(100);
         options.attempts = 1;
         let raw = RawDnsExchange::new(servers, exchange(address, false).provider, options);
-        if system_pair {
-            assert_eq!(
-                raw.exchange(request().to_vec().unwrap())
-                    .await
-                    .unwrap_err()
-                    .kind(),
-                io::ErrorKind::TimedOut
-            );
-            assert!(
-                tokio::time::timeout(Duration::from_millis(20), tcp.accept())
-                    .await
-                    .is_err()
-            );
-        } else {
-            let server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
-                let (mut stream, _) = tcp.accept().await.unwrap();
-                let answer = read_tcp(&mut stream).await.into_response();
-                write_tcp(&mut stream, answer).await;
-            }));
-            let answer = raw.exchange(request().to_vec().unwrap()).await.unwrap();
-            assert_eq!(Message::from_vec(&answer).unwrap().metadata.id, 17);
-            server.await.unwrap();
-        }
+        // Fork policy change: a silent UDP upstream no longer exhausts the slot
+        // on its own. Both the system-discovered pair and the explicitly
+        // configured pair reserve part of the slot for their TCP companion,
+        // because a dropped UDP datagram is the normal failure mode over the
+        // WireGuard tunnel this relay uses. A separately configured TCP
+        // upstream additionally stays a primary wave participant.
+        let server = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            let (mut stream, _) = tcp.accept().await.unwrap();
+            let answer = read_tcp(&mut stream).await.into_response();
+            write_tcp(&mut stream, answer).await;
+        }));
+        let answer = raw.exchange(request().to_vec().unwrap()).await.unwrap();
+        assert_eq!(Message::from_vec(&answer).unwrap().metadata.id, 17);
+        server.await.unwrap();
     }
 }
 
@@ -435,13 +426,17 @@ async fn silent_first_server_does_not_starve_healthy_second_server() {
 }
 
 #[tokio::test]
-async fn unused_tcp_fallback_does_not_mark_udp_timeout_as_setup_pending() {
+async fn udp_timeout_tcp_companion_setup_pending_reflects_fallback_state() {
+    // Fork policy change: the UDP slot now reserves time for a TCP companion,
+    // so a still-pending companion setup at the deadline is a genuine
+    // setup-in-flight signal (the refreshing resolver retries it). A companion
+    // whose setup already failed keeps the plain TimedOut error.
     for completed in [false, true] {
         let silent = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
         let mut address = silent.local_addr().unwrap();
         address.set_ip("127.0.0.1".parse().unwrap());
         let mut raw = exchange(address, false);
-        raw.context.options.timeout = Duration::from_millis(30);
+        raw.context.options.timeout = Duration::from_millis(100);
         let mut config = ConnectionConfig::tcp();
         config.port = address.port();
         let (finished, done) = tokio::sync::oneshot::channel();
@@ -466,8 +461,14 @@ async fn unused_tcp_fallback_does_not_mark_udp_timeout_as_setup_pending() {
             connection: Mutex::new(Some(setup)),
         });
         let error = raw.exchange(request().to_vec().unwrap()).await.unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-        assert!(!crate::resolver::dns_setup_pending(&error));
+        if completed {
+            // The pre-seeded setup had failed; the fallback's reconnect then
+            // hits the silent port and errors fast, so no setup is in flight.
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            assert!(!crate::resolver::dns_setup_pending(&error));
+        } else {
+            assert!(crate::resolver::dns_setup_pending(&error));
+        }
     }
 }
 

@@ -236,7 +236,18 @@ impl Controller for Cubic {
     }
 
     fn set_mss(&mut self, mss: usize) {
+        // set_mss fires once per connection, from handshake processing, before
+        // any data segment, ACK or loss event. This is therefore the initial
+        // window application point (RFC 6928 §3): raise every window-state field
+        // to the ten-segment floor. Fields that already exceed it (none today,
+        // but robust against future state) keep their larger value, and a
+        // post-loss connection re-entering set_mss would keep its reduced window.
         self.mss = mss;
+        let initial_cwnd = mss.saturating_mul(super::INITIAL_CWND_SEGMENTS);
+        self.cwnd = self.cwnd.max(initial_cwnd);
+        self.w_max = self.w_max.max(initial_cwnd);
+        self.w_est = self.w_est.max(initial_cwnd as f64);
+        self.cwnd_prior = self.cwnd_prior.max(initial_cwnd);
         self.recompute_k();
     }
 
@@ -612,6 +623,43 @@ mod test {
         let w_max_prev = cubic.w_max;
         cubic.on_loss(Instant::from_millis(0), cubic.cwnd);
         assert!(cubic.w_max < w_max_prev);
+    }
+
+    #[test]
+    fn set_mss_applies_rfc6928_initial_window() {
+        // A 1380-byte MSS (MTU 1420 minus headers) yields a 13.8 KB initial window.
+        let mut cubic = Cubic::new();
+        cubic.set_mss(1380);
+        assert_eq!(
+            cubic.window(),
+            1380 * crate::socket::tcp::congestion::INITIAL_CWND_SEGMENTS
+        );
+        assert_eq!(
+            cubic.w_max,
+            1380 * crate::socket::tcp::congestion::INITIAL_CWND_SEGMENTS
+        );
+        assert_eq!(
+            cubic.w_est,
+            (1380 * crate::socket::tcp::congestion::INITIAL_CWND_SEGMENTS) as f64
+        );
+        assert_eq!(
+            cubic.cwnd_prior,
+            1380 * crate::socket::tcp::congestion::INITIAL_CWND_SEGMENTS
+        );
+
+        // An already-larger window state is never reduced by the floor, and a
+        // second set_mss with the same MSS leaves the larger state intact.
+        let mut cubic = Cubic::new();
+        cubic.set_mss(1380);
+        cubic.cwnd = 1380 * 32;
+        cubic.w_max = 1380 * 32;
+        cubic.w_est = (1380 * 32) as f64;
+        cubic.cwnd_prior = 1380 * 32;
+        cubic.set_mss(1380);
+        assert_eq!(cubic.window(), 1380 * 32);
+        assert_eq!(cubic.w_max, 1380 * 32);
+        assert_eq!(cubic.w_est, (1380 * 32) as f64);
+        assert_eq!(cubic.cwnd_prior, 1380 * 32);
     }
 
     #[test]

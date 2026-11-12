@@ -18,6 +18,12 @@ pub(crate) const BRIDGE_RECV: usize = 2;
 pub(crate) const BRIDGE_SEND: usize = 3;
 const BUFFER_COUNT: usize = 4;
 
+/// Buffers below this size quadruple per growth round; larger ones double.
+/// Chosen so the 32 KiB base reaches 512 KiB in two rounds and the 4 MiB
+/// maximum in five, keeping the transient replacement charge bounded near
+/// the top of the range.
+const GROW_QUADRUPLE_LIMIT: usize = 512 * 1024;
+
 pub(crate) struct TcpBufferPool {
     initial: usize,
     maximum: usize,
@@ -123,7 +129,13 @@ impl TcpBufferAllocation {
         resize: impl FnOnce(usize) -> bool,
     ) -> bool {
         let old = state.capacities[buffer];
-        let new = old.saturating_mul(2).min(self.pool.maximum);
+        // Quadruple while small so a long-delayed path reaches a useful window
+        // in a couple of growth rounds instead of seven doublings (a ~350 ms
+        // Paris↔Sydney RTT makes each round cost a full window of bytes).
+        // Double above that so the transient replacement charge stays bounded
+        // near the maximum.
+        let factor = if old < GROW_QUADRUPLE_LIMIT { 4 } else { 2 };
+        let new = old.saturating_mul(factor).min(self.pool.maximum);
         // The old allocation remains charged until `resize` has finished.
         let Some(mut temporary) = self.pool.growth.acquire(new) else {
             return false;
@@ -188,20 +200,20 @@ mod tests {
         let limits = TunResourceLimits {
             tcp_buffer_size: 1024,
             tcp_buffer_max_size: Some(4096),
-            tcp_memory_bytes: Some(4096 + 2048),
+            tcp_memory_bytes: Some(8192),
             max_tcp_connections: Some(1),
             ..Default::default()
         };
         let pool = TcpBufferPool::from_limits(&limits).unwrap();
         let flow = pool.admit().unwrap();
         assert!(!flow.grow_if_needed(SOCKET_RECV, 1024, |new| {
-            assert_eq!(new, 2048);
-            assert_eq!(pool.growth.snapshot().active, 2048);
+            assert_eq!(new, 4096);
+            assert_eq!(pool.growth.snapshot().active, 4096);
             false
         }));
         assert_eq!(pool.growth.snapshot().active, 0);
         assert!(flow.grow_if_needed(SOCKET_RECV, 1024, |_| true));
-        assert_eq!(pool.growth.snapshot().active, 1024);
+        assert_eq!(pool.growth.snapshot().active, 3072);
         assert!(!flow.grow_if_needed(SOCKET_SEND, 1024, |_| panic!("no transient capacity")));
         drop(flow);
         assert_eq!(pool.growth.snapshot().active, 0);
@@ -228,27 +240,27 @@ mod tests {
         let pool = TcpBufferPool::from_limits(&limits()).unwrap();
         let flow = pool.admit().unwrap();
         assert!(!flow.grow_for_progress(SOCKET_RECV, 32767, |_| panic!("insufficient progress")));
-        assert!(flow.grow_for_progress(SOCKET_RECV, 32768, |capacity| capacity == 65536));
+        assert!(flow.grow_for_progress(SOCKET_RECV, 32768, |capacity| capacity == 131072));
         assert!(
-            !flow.grow_for_progress(SOCKET_RECV, 32768 + 65535, |_| panic!(
+            !flow.grow_for_progress(SOCKET_RECV, 32768 + 131071, |_| panic!(
                 "next tier requires new bytes"
             ))
         );
         let attempts = std::cell::Cell::new(0);
-        assert!(!flow.grow_for_progress(SOCKET_RECV, 32768 + 65536, |_| {
+        assert!(!flow.grow_for_progress(SOCKET_RECV, 32768 + 131072, |_| {
             attempts.set(attempts.get() + 1);
             false
         }));
         for _ in 0..8 {
-            assert!(!flow.grow_for_progress(SOCKET_RECV, 32768 + 65536, |_| {
+            assert!(!flow.grow_for_progress(SOCKET_RECV, 32768 + 131072, |_| {
                 attempts.set(attempts.get() + 1);
                 true
             }));
         }
         assert_eq!(attempts.get(), 1);
         assert!(
-            flow.grow_for_progress(SOCKET_RECV, 32768 + 2 * 65536, |capacity| capacity
-                == 131072)
+            flow.grow_for_progress(SOCKET_RECV, 32768 + 2 * 131072, |capacity| capacity
+                == 524288)
         );
         assert!(pool.growth.snapshot().peak + 80 * 4 * 32768 <= 32 * 1024 * 1024);
     }

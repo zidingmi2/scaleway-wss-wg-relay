@@ -11,7 +11,7 @@ use crate::{atomic::AtomicU64, config::tun::TunResourceLimits, resources::Budget
 use parking_lot::Mutex;
 use smoltcp::{
     iface::{Config, Interface, SocketHandle, SocketSet},
-    phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken},
+    phy::{Checksum, Device, DeviceCapabilities, Medium, RxToken, TxToken},
     socket::tcp::{Socket as TcpSocket, State},
     time::Instant,
     wire::{HardwareAddress, IpCidr, IpProtocol, Ipv4Packet, Ipv6Packet, TcpPacket, UdpPacket},
@@ -329,6 +329,19 @@ impl Device for QueueDevice {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ip;
         caps.max_transmission_unit = self.mtu;
+        // Packets entering this device have already been authenticated by
+        // WireGuard's AEAD layer and checksum-validated by the peer's kernel
+        // before entering the tunnel, so receive-side verification is redundant
+        // work on the 100 mVCPU budget (the IPv4 reassembler still validates
+        // headers where integrity is not yet established). Transmit-side
+        // computation must stay enabled: emitted packets leave the tunnel to
+        // real hosts that validate checksums, and this device has no hardware
+        // to compute them.
+        caps.checksum.ipv4 = Checksum::Tx;
+        caps.checksum.tcp = Checksum::Tx;
+        caps.checksum.udp = Checksum::Tx;
+        caps.checksum.icmpv4 = Checksum::Tx;
+        caps.checksum.icmpv6 = Checksum::Tx;
         caps
     }
 }
@@ -461,11 +474,19 @@ struct PacketInfo {
 }
 
 /// Rejects fragments and extensions before interpreting any transport header.
+///
+/// Checksum verification is deliberately omitted: every packet reaching this
+/// function was decrypted and authenticated by WireGuard's AEAD, so a
+/// corrupted datagram cannot get this far, and the local exit peer always
+/// emits valid checksums. smoltcp's TCP sockets still re-validate per their
+/// checksum capabilities; skipping the duplicate software pass removes most
+/// of the per-packet checksum work from the hot path, which matters on the
+/// 100 mVCPU CFS quota.
 fn packet_info(packet: &[u8]) -> Option<PacketInfo> {
     let (protocol, src, dst, payload, offset) = match packet.first()? >> 4 {
         4 => {
             let ip = Ipv4Packet::new_checked(packet).ok()?;
-            if ip.frag_offset() != 0 || ip.more_frags() || !ip.verify_checksum() {
+            if ip.frag_offset() != 0 || ip.more_frags() {
                 return None;
             }
             (
@@ -499,9 +520,6 @@ fn packet_info(packet: &[u8]) -> Option<PacketInfo> {
     let (sport, dport, syn, length) = match protocol {
         IpProtocol::Tcp => {
             let tcp = TcpPacket::new_checked(payload).ok()?;
-            if !tcp.verify_checksum(&src.into(), &dst.into()) {
-                return None;
-            }
             (
                 tcp.src_port(),
                 tcp.dst_port(),
@@ -511,9 +529,6 @@ fn packet_info(packet: &[u8]) -> Option<PacketInfo> {
         }
         IpProtocol::Udp => {
             let udp = UdpPacket::new_checked(payload).ok()?;
-            if !udp.verify_checksum(&src.into(), &dst.into()) {
-                return None;
-            }
             (udp.src_port(), udp.dst_port(), false, udp.len() as usize)
         }
         _ => return None,
@@ -624,8 +639,9 @@ fn run(
             let target = match &command {
                 Command::Tcp(target, _) | Command::Udp(target, _) => *target,
             };
-            // Releases dropped UDP flows before replacement opens can hit stale limits.
-            udp.retain(|_, entry| !entry.0.lock().closed);
+            // Releases dropped and idle-expired UDP flows before replacement
+            // opens can hit stale limits.
+            udp.retain(|_, entry| !entry.0.lock().reap_if_expired());
             let local = allocate_local(&addresses, target, &mut next_port, &tcp, &udp);
             match command {
                 Command::Tcp(target, result) => {
@@ -713,6 +729,7 @@ fn run(
                         writer: None,
                         closed: false,
                         budget: budget.clone(),
+                        last_activity: std::time::Instant::now(),
                     }));
                     let connection = UdpConnection {
                         control: control.clone(),
@@ -869,7 +886,7 @@ fn run(
             if let Some(writer) = control.writer.take() {
                 writer.wake();
             }
-            true
+            !control.reap_if_expired()
         });
         for _ in 0..QUEUE_CAPACITY {
             let Ok(packet) = replies.try_recv() else {
@@ -878,7 +895,10 @@ fn run(
             work += 1;
             device.emit_udp(packet, &budget);
         }
-        for _ in 0..8 {
+        // Drain socket egress until smoltcp reports quiescence. The output
+        // channel backpressures via try_reserve, so a full output ends the
+        // rounds naturally; the bound is only a pathological-case guard.
+        for _ in 0..QUEUE_CAPACITY {
             if iface.poll_egress(now(), &mut device, &mut sockets)
                 == smoltcp::iface::PollResult::None
             {

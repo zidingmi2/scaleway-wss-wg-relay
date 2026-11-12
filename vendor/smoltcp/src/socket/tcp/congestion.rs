@@ -10,6 +10,15 @@ pub(super) mod cubic;
 #[cfg(feature = "socket-tcp-reno")]
 pub(super) mod reno;
 
+/// RFC 6928 §3: the initial congestion window SHOULD be ten segments.
+///
+/// Fork deviation: the pre-fork controllers started at two segments, which made
+/// the first RTTs of every flow crawl on high-latency paths (this relay serves
+/// flows with roughly 300 ms RTT inside a WireGuard tunnel). The controllers
+/// apply this as a floor when the real MSS becomes known at handshake time,
+/// before any data or loss event; post-loss windows are unaffected.
+pub(super) const INITIAL_CWND_SEGMENTS: usize = 10;
+
 #[allow(unused_variables)]
 pub(super) trait Controller {
     /// Returns the number of bytes that can be sent.

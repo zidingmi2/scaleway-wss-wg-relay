@@ -1033,7 +1033,14 @@ async fn build_resolver_from_specs(
         });
 
         let policy = RefreshPolicy {
-            max_idle: Duration::from_secs(60),
+            // Idle rebuilds exist to retire stale pooled transports, but the
+            // rebuilt resolver drops the response cache with them. On this
+            // relay every DNS query crosses the WireGuard tunnel, so a cache
+            // discarded after a 60 s idle gap turned the first lookup of each
+            // burst into an extra round trip. One hour of idle still bounds
+            // stale-transport retention, and connection errors keep triggering
+            // the immediate rebuild-and-retry path below regardless of idleness.
+            max_idle: Duration::from_secs(3600),
             retry_once_after_refresh: true,
         };
 

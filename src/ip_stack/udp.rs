@@ -9,10 +9,19 @@ use std::{
     pin::Pin,
     sync::{Arc, atomic::Ordering},
     task::{Context, Poll, Waker},
+    time::Duration,
 };
 use tokio::io::ReadBuf;
 
 const FLOW_QUEUE_CAPACITY: usize = 8;
+
+/// Idle lifetime of an outbound UDP flow (one local-address five-tuple). The
+/// stack thread reaps flows after this long without a send or a receive, so
+/// abandoned DNS or UDP sessions cannot accumulate for the process lifetime on
+/// a 128 MB host. Pending datagrams and waiting wakers keep the flow alive
+/// until they drain; a reaped flow surfaces as BrokenPipe on the next handle
+/// use, matching the existing close semantics.
+pub(crate) const UDP_FLOW_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub(crate) struct Datagram {
     pub packet: PacketBuffer,
@@ -27,6 +36,7 @@ pub(crate) struct UdpControl {
     pub writer: Option<Waker>,
     pub closed: bool,
     pub budget: Arc<Budget>,
+    pub last_activity: std::time::Instant,
 }
 
 impl UdpControl {
@@ -37,6 +47,7 @@ impl UdpControl {
         let Some(permits) = udp_budget::reserve(&self.budget, packet.len()) else {
             return false;
         };
+        self.last_activity = std::time::Instant::now();
         self.incoming.push_back(Datagram {
             packet: packet.into_payload(true).with_lease(Arc::new(permits)),
         });
@@ -55,6 +66,21 @@ impl UdpControl {
         if let Some(waker) = self.writer.take() {
             waker.wake();
         }
+    }
+    /// Closes and reports reaping for flows idle past [`UDP_FLOW_IDLE_TIMEOUT`]
+    /// with no pending work. Returns whether the flow should be removed.
+    pub fn reap_if_expired(&mut self) -> bool {
+        if self.closed {
+            return true;
+        }
+        if self.incoming.is_empty()
+            && self.outgoing.is_empty()
+            && self.last_activity.elapsed() > UDP_FLOW_IDLE_TIMEOUT
+        {
+            self.close();
+            return true;
+        }
+        false
     }
 }
 
@@ -127,6 +153,7 @@ impl AsyncWriteMessage for UdpConnection {
             self.drops.fetch_add(1, Ordering::Relaxed);
             return Poll::Ready(Ok(()));
         };
+        control.last_activity = std::time::Instant::now();
         // This path deliberately uses exact, nonpooled storage: small datagrams
         // must not pin a jumbo packet allocation or hide capacity from budgets.
         let builder = match (control.local, control.remote) {

@@ -92,7 +92,10 @@ impl WebsocketStream {
         let mut unprocessed_buf =
             allocate_vec(16384.max(unprocessed_data.len())).into_boxed_slice();
         let mut unprocessed_end_offset = 0;
-        let write_frame = allocate_vec(32768).into_boxed_slice();
+        // 64 KiB holds one full 32 KiB payload frame (plus its header/mask) and
+        // leaves room for a coalesced ping/pong, halving frame and syscall counts
+        // on bulk paths versus the old 32 KiB buffer.
+        let write_frame = allocate_vec(65536).into_boxed_slice();
         let ping_data = allocate_vec(MAX_CONTROL_PAYLOAD_LEN).into_boxed_slice();
 
         let pending_initial_data = if !unprocessed_data.is_empty() {
@@ -764,6 +767,13 @@ impl AsyncStream for WebsocketStream {
     fn peer_addr(&self) -> Option<std::net::SocketAddr> {
         self.stream.peer_addr()
     }
+    /// Every non-empty poll_write packs at least one new binary frame, so relay
+    /// chunk sizes directly set the frame size. 32 KiB keeps a payload frame
+    /// within the 64 KiB packing buffer while halving frames and downstream
+    /// write syscalls for bulk traffic.
+    fn preferred_write_size(&self) -> Option<std::num::NonZeroUsize> {
+        std::num::NonZeroUsize::new(32768)
+    }
 }
 
 #[inline]
@@ -816,9 +826,60 @@ fn pack_frame(opcode: u8, use_mask: bool, input: &[u8], output: &mut [u8]) -> us
 }
 
 /// XORs `bytes` with `mask`, starting `offset` bytes into the mask.
+///
+/// Payload length dominates ingress throughput, so full 4-byte groups are
+/// masked as one word instead of paying a modulo per byte; only the trailing
+/// remainder (at most three bytes) falls back to per-byte masking. No
+/// address-alignment assumptions are needed because each word is reassembled
+/// from bytes on both sides.
 fn apply_mask(bytes: &mut [u8], mask: &[u8; 4], offset: usize) {
-    for (i, byte) in bytes.iter_mut().enumerate() {
-        *byte ^= mask[(offset + i) % 4];
+    let phase = offset % 4;
+    // Every full 4-byte group starts at (offset + 4 * group) % 4, which is
+    // always `phase`, so one rotated pattern covers all of them.
+    let pattern = u32::from_ne_bytes([
+        mask[phase],
+        mask[(phase + 1) % 4],
+        mask[(phase + 2) % 4],
+        mask[(phase + 3) % 4],
+    ]);
+    let mut groups = bytes.chunks_exact_mut(4);
+    for group in &mut groups {
+        let word = u32::from_ne_bytes(group.try_into().unwrap());
+        group.copy_from_slice(&(word ^ pattern).to_ne_bytes());
+    }
+    for (index, byte) in groups.into_remainder().iter_mut().enumerate() {
+        *byte ^= mask[(phase + index) % 4];
+    }
+}
+
+#[cfg(test)]
+mod mask_tests {
+    use super::apply_mask;
+
+    /// The word-wise fast path must agree with the obvious bytewise
+    /// definition for every mask phase and every size, including slices that
+    /// start and end mid-group.
+    #[test]
+    fn apply_mask_matches_the_bytewise_definition_for_all_offsets() {
+        fn reference(bytes: &mut [u8], mask: &[u8; 4], offset: usize) {
+            for (index, byte) in bytes.iter_mut().enumerate() {
+                *byte ^= mask[(offset + index) % 4];
+            }
+        }
+        let mask = [0x11, 0x22, 0x33, 0x44];
+        for offset in 0..8 {
+            for size in [0, 1, 3, 4, 5, 7, 8, 15, 16, 17, 63, 64, 65, 1000] {
+                for skip in 0..4 {
+                    // `skip` shifts the masked slice's start within the
+                    // heap allocation, exercising mid-group starts.
+                    let mut full: Vec<u8> = (0..size + skip).map(|i| (i * 7 + 3) as u8).collect();
+                    let mut expected = full.clone();
+                    apply_mask(&mut full[skip..], &mask, offset);
+                    reference(&mut expected[skip..], &mask, offset);
+                    assert_eq!(full, expected, "size {size} offset {offset} skip {skip}");
+                }
+            }
+        }
     }
 }
 

@@ -147,6 +147,16 @@ The exact lost-FIN allowance, FIN-only ACK frontier and RST cursor are retained
 fork policies, not universal RFC or OS behavior. Keepalive sequence placement
 does not establish timer reachability with outstanding data.
 
+Shoes carries three deliberate local deviations on top of this pin, each
+documented at its constant and regression-tested here: `RTTE_MIN_RTO` is 300 ms
+instead of the RFC 6298 1 second (the tunnel RTT is roughly 300 ms and the old
+floor made every loss wait three RTTs); the congestion controllers apply an
+RFC 6928 ten-segment initial window when the real MSS becomes known at
+handshake time (`INITIAL_CWND_SEGMENTS`), never reducing a post-loss window;
+and one zero-window timer test's schedule reflects the smaller floor. When
+updating the pin, re-apply these three deviations and re-run the Reno and
+CUBIC regressions plus the socket timer tests.
+
 Shoes retains explicit CUBIC, IPv4/IPv6, medium-IP and 32-segment assembly.
 Linux TUN transmit offload remains IPv4-only: the interface still does not
 forward IPv6 segmentation metadata. TUN supplies partial TCP checksums when

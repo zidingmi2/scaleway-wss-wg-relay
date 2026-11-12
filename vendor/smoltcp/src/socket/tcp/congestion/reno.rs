@@ -100,7 +100,12 @@ impl Controller for Reno {
     }
 
     fn set_mss(&mut self, mss: usize) {
+        // set_mss fires once per connection, from handshake processing, before
+        // any data segment, ACK or loss event (RFC 6928 §3; see cubic.rs).
         self.mss = mss;
+        self.cwnd = self
+            .cwnd
+            .max(mss.saturating_mul(super::INITIAL_CWND_SEGMENTS));
     }
 
     fn set_remote_window(&mut self, remote_window: usize) {
@@ -397,6 +402,24 @@ mod test {
         ack(&mut reno, MSS, Instant::from_millis(2));
         reno.on_rto(Instant::from_millis(3), MSS * 4);
         assert_eq!(reno.ssthresh, MSS * 2);
+    }
+
+    #[test]
+    fn set_mss_applies_rfc6928_initial_window() {
+        // A 1380-byte MSS (MTU 1420 minus headers) yields a 13.8 KB initial window.
+        let mut reno = Reno::new();
+        reno.set_mss(1380);
+        assert_eq!(
+            reno.window(),
+            1380 * crate::socket::tcp::congestion::INITIAL_CWND_SEGMENTS
+        );
+
+        // An already-larger window is never reduced by the floor.
+        let mut reno = Reno::new();
+        reno.set_mss(1380);
+        reno.cwnd = 1380 * 32;
+        reno.set_mss(1380);
+        assert_eq!(reno.window(), 1380 * 32);
     }
 
     #[test]

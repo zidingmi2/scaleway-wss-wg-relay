@@ -17,7 +17,11 @@ use std::task::{Context, Poll};
 use crate::async_stream::AsyncStream;
 use crate::util::allocate_vec;
 
-const DEFAULT_BUF_SIZE: usize = 16384;
+// Doubled from 16 KiB so relay chunks fill whole 32 KiB WebSocket frames
+// (WebsocketStream::preferred_write_size caps per-frame payloads there),
+// halving frame and syscall counts on bulk paths. Interactive traffic is
+// unaffected: the copy loop flushes as soon as both sides are pending.
+const DEFAULT_BUF_SIZE: usize = 32768;
 pub(crate) const MAX_COPY_BYTES_PER_POLL: usize = 1024 * 1024;
 
 #[derive(Debug)]

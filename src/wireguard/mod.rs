@@ -490,6 +490,33 @@ impl PreparedEndpoint {
                     &mut tasks, &mut stack, selector, resolver, limits,
                 ));
             }
+            // Warm the peer session before serving: a cold start or scale-up
+            // otherwise pays the full handshake round trip on the first user
+            // connection. Failure only falls back to the on-demand handshake.
+            let warmup = async {
+                for peer in device.peers().await {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        device.force_handshake(&peer.peer.public_key),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {
+                            log::info!("WireGuard endpoint {name} warm-up handshake complete")
+                        }
+                        Ok(Err(error)) => log::warn!(
+                            "WireGuard endpoint {name} warm-up handshake failed: {error}; relying on on-demand handshake"
+                        ),
+                        Err(_) => log::warn!(
+                            "WireGuard endpoint {name} warm-up handshake timed out; relying on on-demand handshake"
+                        ),
+                    }
+                }
+            };
+            tokio::select! {
+                _ = shutdown.cancelled() => {}
+                _ = warmup => {}
+            }
             let mut report = tokio::time::interval(std::time::Duration::from_secs(60));
             report.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let failed = loop {

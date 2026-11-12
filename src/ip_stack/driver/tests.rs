@@ -233,6 +233,7 @@ fn local_allocation_preserves_family_order_wraps_and_skips_both_flow_types() {
             writer: None,
             closed: false,
             budget: Arc::new(Budget::new(None)),
+            last_activity: std::time::Instant::now(),
         }))),
     )]);
     let mut next_port = LAST_EPHEMERAL_PORT;
@@ -1382,7 +1383,7 @@ fn classification_tracks_transport_offset_and_length() {
 }
 
 #[test]
-fn classification_rejects_fragments_extensions_and_bad_checksums() {
+fn classification_rejects_fragments_and_extensions_but_trusts_wireguard_integrity() {
     let packet = || {
         crate::tun::udp_handler::build_udp_packet(
             b"data",
@@ -1400,12 +1401,18 @@ fn classification_rejects_fragments_extensions_and_bad_checksums() {
         ip.fill_checksum();
         assert!(packet_info(&bytes).is_none());
     }
+    // A corrupted checksum is no longer rejected here: everything reaching
+    // packet_info() has already been authenticated by WireGuard's AEAD, so a
+    // duplicate software pass would be dead work. Fragment and extension
+    // rejection stays, because those change how the transport header is
+    // located.
     let mut bytes = packet();
     bytes[31] ^= 1;
-    assert!(packet_info(&bytes).is_none());
+    assert!(packet_info(&bytes).is_some());
+    // The IPv4 header checksum (bytes 10-11) is equally redundant here.
     let mut bytes = packet();
     bytes[10] ^= 1;
-    assert!(packet_info(&bytes).is_none());
+    assert!(packet_info(&bytes).is_some());
     let mut bytes = crate::tun::udp_handler::build_udp_packet(
         b"data",
         "[fd77::1]:1".parse().unwrap(),

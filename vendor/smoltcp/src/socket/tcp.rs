@@ -178,7 +178,14 @@ const RTTE_K: u32 = 4;
 
 // RFC 6298 (2.4): Whenever RTO is computed, if it is less than 1 second, then the
 // RTO SHOULD be rounded up to 1 second.
-const RTTE_MIN_RTO: u16 = 1000;
+//
+// Fork deviation: the 1-second floor is relaxed to 300 ms. This relay terminates
+// TCP inside a userspace stack over a single WireGuard hop whose RTT is roughly
+// 300 ms; clamping RTO to 1 s made every loss wait at least three times the
+// path RTT before retransmitting. The estimator still adds its variance margin
+// (RTTE_MIN_MARGIN + K*rttvar) and starts at RTTE_INITIAL_RTO, so the effective
+// RTO remains conservative while adapting to the measured RTT.
+const RTTE_MIN_RTO: u16 = 300;
 
 // RFC 6298 (2.5) A maximum value MAY be placed on RTO provided it is at least 60
 // seconds
@@ -9965,23 +9972,26 @@ mod test {
             window_len: 0,
             ..SEND_TEMPL
         });
-        // Retransmit timer is armed (RFC 6298 (5.3)).
+        // Retransmit timer is armed (RFC 6298 (5.3)). The 100 ms RTT sample
+        // yields srtt=100/rttvar=50 and RTO=300 under the fork's 300 ms floor
+        // (pre-fork the 1 s floor made this 1100).
         assert_eq!(
             s.socket.poll_at(&mut s.cx),
-            PollAt::Time(Instant::from_millis(1100))
+            PollAt::Time(Instant::from_millis(400))
         );
 
-        recv_nothing!(s, time 1099);
+        recv_nothing!(s, time 399);
         // Retransmit timer fires but the window is closed so nothing is received.
-        recv_nothing!(s, time 1100);
-        // Zero-window probe timer is armed (RFC 9293 §3.8.6.1)
+        recv_nothing!(s, time 400);
+        // Zero-window probe timer is armed (RFC 9293 §3.8.6.1) with the
+        // doubled backoff: 400 + 2 * 300.
         assert_eq!(
             s.socket.poll_at(&mut s.cx),
-            PollAt::Time(Instant::from_millis(3100))
+            PollAt::Time(Instant::from_millis(1000))
         );
 
-        // Reopen the window.
-        send!(s, time 2000, TcpRepr {
+        // Reopen the window before the probe can fire.
+        send!(s, time 900, TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1 + 6),
             window_len: 64,
@@ -9990,17 +10000,17 @@ mod test {
 
         // The window is reopened, so the in-flight data is resent immediately.
         assert_eq!(s.socket.poll_at(&mut s.cx), PollAt::Now);
-        recv!(s, time 2000, Ok(TcpRepr {
+        recv!(s, time 900, Ok(TcpRepr {
             control:    TcpControl::Psh,
             seq_number: LOCAL_SEQ + 1 + 6,
             ack_number: Some(REMOTE_SEQ + 1),
             payload:    &b"012345"[..],
             ..RECV_TEMPL
         }), exact);
-        // Retransmit timer is armed.
+        // Retransmit timer is armed with the backed-off RTO.
         assert_eq!(
             s.socket.poll_at(&mut s.cx),
-            PollAt::Time(Instant::from_millis(4000))
+            PollAt::Time(Instant::from_millis(1500))
         );
     }
 
@@ -11378,7 +11388,9 @@ mod test {
     fn test_set_get_rto() {
         let mut s = socket_established();
 
-        assert_eq!(s.min_rto(), Duration::from_millis(1000));
+        // Fork deviation: the default floor is 300 ms (see RTTE_MIN_RTO); the
+        // initial RTO stays at the RFC 6298 1 second.
+        assert_eq!(s.min_rto(), Duration::from_millis(300));
         assert_eq!(s.initial_rto(), Duration::from_millis(1000));
 
         s.set_min_rto(Duration::from_millis(20));
