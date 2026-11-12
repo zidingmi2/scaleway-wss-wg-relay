@@ -1,0 +1,33 @@
+use std::{fmt::Debug, io, sync::Arc};
+
+use async_trait::async_trait;
+
+use crate::async_stream::AsyncStream;
+#[cfg(not(feature = "relay-minimal"))]
+use crate::quic_endpoint::QuicEndpoint;
+
+/// Identity of the selected route, not merely its destination. Connector instances
+/// are retained by the dialer, so their addresses cannot be recycled while pooled.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct RouteKey(pub Vec<usize>);
+
+#[cfg(not(feature = "relay-minimal"))]
+pub struct QuicCarrier {
+    pub connection: quinn::Connection,
+    pub(crate) _endpoint: Arc<QuicEndpoint>,
+}
+
+#[cfg(feature = "relay-minimal")]
+pub enum QuicCarrier {}
+
+#[async_trait]
+pub trait CarrierDialer: Debug + Send + Sync {
+    fn route_key(&self) -> &RouteKey;
+    async fn open_stream(&self) -> io::Result<Box<dyn AsyncStream>>;
+    async fn open_quic(&self) -> io::Result<QuicCarrier> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "native QUIC requires a first-hop QUIC carrier",
+        ))
+    }
+}

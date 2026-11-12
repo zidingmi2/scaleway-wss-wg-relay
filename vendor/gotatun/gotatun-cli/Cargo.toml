@@ -1,0 +1,60 @@
+[package]
+name = "gotatun-cli"
+description = "an implementation of the WireGuard® protocol designed for portability and speed"
+version = "0.10.2"
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+repository.workspace = true
+license.workspace = true
+keywords = ["vpn", "wireguard"]
+categories = ["command-line-utilities", "network-programming"]
+
+[[bin]]
+name = "gotatun"
+path = "src/main.rs"
+
+[dependencies]
+mimalloc = { workspace = true, default-features = false, optional = true }
+
+[target.'cfg(unix)'.dependencies]
+clap = { workspace = true, features = ["derive", "env"] }
+daemonize = { workspace = true }
+eyre = { workspace = true }
+gotatun = { workspace = true, features = ["device", "tun"] }
+libc = { workspace = true }
+nix = { workspace = true, default-features = false, features = [
+  "fs",
+  "net",
+  "socket",
+  "time",
+  "uio",
+  "user",
+] }
+tikv-jemallocator = { workspace = true, default-features = false, optional = true }
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+clap = { workspace = true, features = ["derive", "env"] }
+eyre = { workspace = true }
+gotatun = { workspace = true, features = ["device", "tun"] }
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[features]
+default = ["aws-lc-rs"]
+# Use the `aws-lc-rs` crate as the AEAD backend. Default.
+aws-lc-rs = ["gotatun/aws-lc-rs"]
+# Use jemalloc as allocator instead of system default.
+jemalloc = ["dep:tikv-jemallocator"]
+# Use mimalloc as allocator instead of system default.
+mimalloc = ["dep:mimalloc"]
+# Use the `ring` crate as the AEAD backend. Combine with
+# `--no-default-features` to avoid also pulling in `aws-lc-rs`.
+ring = ["gotatun/ring"]

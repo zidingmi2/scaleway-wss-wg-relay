@@ -1,0 +1,251 @@
+[package]
+name = "shoes"
+version = "0.3.7"
+publish = false # Cargo strips fork patches from crates.io packages.
+edition = "2024"
+rust-version = "1.99.1"
+autotests = false
+autobenches = false
+license = "MIT"
+description = "Specialized Trojan/WebSocket to userspace WireGuard relay with bounded buffers."
+homepage = "https://github.com/zidingmi2/scaleway-wss-wg-relay"
+repository = "https://github.com/zidingmi2/scaleway-wss-wg-relay"
+readme = "README.md"
+keywords = ["proxy", "wireguard", "trojan", "websocket", "serverless"]
+categories = ["command-line-utilities", "network-programming"]
+
+[workspace]
+members = ["tests/support"]
+exclude = ["vendor/gotatun", "vendor/smoltcp"]
+resolver = "3"
+
+[patch.crates-io]
+# Includes portable 64-bit atomics for MIPS32 and other targets without native support.
+gotatun = { path = "vendor/gotatun/gotatun" }
+# REALITY patches on stable rustls: reality/0.23.46-f04804fa1334. Pins the patched commit, not the branch.
+rustls = { git = "https://github.com/cfal/rustls", rev = "f1a23c187330386e9e7f14a21dbae368034dc430" }
+blake3 = { git = "https://github.com/cfal/BLAKE3", rev = "cd98c1c4112ed3b2cf2140e1844f266b3d665b53" }
+# Bounds buffered H3 frames before payload reads and skips unknown frames incrementally.
+h3 = { git = "https://github.com/cfal/h3", rev = "90e3013710e35143d1969dc3421f5951fbe49966" }
+h3-quinn = { git = "https://github.com/cfal/h3", rev = "90e3013710e35143d1969dc3421f5951fbe49966" }
+# Preserves connection-close failover and bounded TCP/DoT receive progress.
+hickory-net = { git = "https://github.com/cfal/hickory-dns", rev = "14df4ec4d6c501e23d7815cecd7f556b1cece4a1" }
+hickory-proto = { git = "https://github.com/cfal/hickory-dns", rev = "14df4ec4d6c501e23d7815cecd7f556b1cece4a1" }
+hickory-resolver = { git = "https://github.com/cfal/hickory-dns", rev = "14df4ec4d6c501e23d7815cecd7f556b1cece4a1" }
+# Includes nix-rust/nix#2821 for iOS socket feature compatibility.
+nix = { git = "https://github.com/nix-rust/nix", rev = "3eae6d68ec6382fef7b38cd58f97458e59a71af9" }
+# Preserves TCP ACK sequences during retransmission.
+smoltcp = { path = "vendor/smoltcp" }
+
+[lib]
+name = "shoes"
+# rlib = Rust library (for Rust dependencies)
+# cdylib = C dynamic library (.so on Linux/Android, .dylib on macOS)
+# staticlib = C static library (.a) - required for iOS
+crate-type = ["rlib"]
+
+[[bin]]
+name = "shoes"
+path = "src/main.rs"
+
+[features]
+default = ["full"]
+relay-minimal = []
+full = ["dep:h3", "dep:h3-quinn", "dep:quinn", "dep:quinn-proto", "dep:instant-acme", "dep:notify", "dep:tun", "dep:rtnetlink", "hickory-resolver/h3-aws-lc-rs", "dep:blake2", "dep:digest", "dep:md-5", "dep:shake", "dep:ml-kem", "dep:rust-argon2", "dep:h2", "dep:http-body-util", "dep:hyper", "dep:hyper-util", "dep:hyper-tungstenite", "dep:mime_guess", "dep:sntpc"]
+ffi = []  # Enable FFI module for non-Android builds
+integration-tests = []
+optional-peer-tests = ["integration-tests"]
+external-network-tests = ["integration-tests"]
+privileged-tests = ["integration-tests"]
+stress-tests = ["integration-tests"]
+
+[[test]]
+name = "relay_acceptance"
+path = "tests/relay_acceptance.rs"
+required-features = ["relay-minimal"]
+
+[[test]]
+name = "process_contract"
+path = "tests/process_contract.rs"
+
+[[test]]
+name = "rule_allocation"
+path = "tests/rule_allocation.rs"
+
+[[test]]
+name = "retention_allocation"
+path = "tests/retention_allocation.rs"
+
+[[test]]
+name = "matcher_invariants"
+path = "tests/matcher_invariants.rs"
+
+[[test]]
+name = "rule_properties"
+path = "tests/rule_properties.rs"
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+required-features = ["integration-tests"]
+
+[[test]]
+name = "external_network"
+path = "tests/external_network.rs"
+required-features = ["external-network-tests"]
+
+[[test]]
+name = "optional_peer"
+path = "tests/optional_peer.rs"
+required-features = ["optional-peer-tests"]
+
+[[test]]
+name = "xhttp_interop"
+path = "tests/xhttp_interop.rs"
+required-features = ["integration-tests"]
+
+[[test]]
+name = "ws_early_data"
+path = "tests/ws_early_data.rs"
+required-features = ["integration-tests"]
+
+[[test]]
+name = "reality_interop"
+path = "tests/reality_interop.rs"
+required-features = ["optional-peer-tests"]
+
+[[test]]
+name = "vless_encryption_interop"
+path = "tests/vless_encryption_interop.rs"
+required-features = ["optional-peer-tests"]
+
+[[test]]
+name = "privileged"
+path = "tests/privileged.rs"
+required-features = ["privileged-tests"]
+
+[[test]]
+name = "stress"
+path = "tests/stress.rs"
+required-features = ["stress-tests"]
+
+[dependencies]
+aho-corasick = "1"
+anyhow = "1"
+async-trait = "*"
+aws-lc-rs = { version = "*", default-features = false }
+base64 = "*"
+blake2 = { version = "0.11", optional = true }
+blake3 = "*"
+bytes = "*"
+chrono = "*"
+dashmap = "*"
+digest = { version = "*", optional = true }
+etherparse = "*"
+futures = "*"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+ruzstd = "0.9.1"
+prost = "0.14.4"
+yaml-rust2 = { version = "0.13", default-features = false }
+h2 = { version = "*", optional = true }
+h3 = { version = "*", features = ["i-implement-a-third-party-backend-and-opt-into-breaking-changes"] , optional = true }
+h3-quinn = { version = "*", optional = true }
+hickory-resolver = { version = "*", default-features = false, features = ["tokio", "tls-aws-lc-rs", "https-aws-lc-rs"] }
+http = "*"
+httpdate = "1"
+http-body-util = { version = "*", optional = true }
+httparse = "*"
+hyper = { version = "*", features = ["client", "server", "http1", "http2"] , optional = true }
+hyper-util = { version = "*", features = ["tokio", "server"] , optional = true }
+hyper-tungstenite = { version = "0.30.0", optional = true }
+memory-stats = "1.2.0"
+indexmap = "*"
+instant-acme = { version = "=0.8.5", default-features = false, features = ["aws-lc-rs", "rcgen", "time", "x509-parser"] , optional = true }
+ipnetwork = { version = "0.21", features = ["serde"] }
+libc = "*"
+log = { version = "*", features = ["std", "release_max_level_info"] }
+lru = "*"
+md-5 = { version = "*", optional = true }
+memchr = "*"
+mime_guess = { version = "*", optional = true }
+ml-kem = { version = "0.3.4", features = ["zeroize"] , optional = true }
+notify = { version = "*", optional = true }
+# 0.13's futex_time64 probe triggers SIGSYS on 32-bit Android API 26-29.
+parking_lot = "0.12.5"
+percent-encoding = "*"
+quinn = { version = "*", default-features = false, features = ["log", "runtime-tokio", "rustls-aws-lc-rs"] , optional = true }
+quinn-proto = { version = "0.11", default-features = false , optional = true }
+rand = "*"
+rand_core = "*"
+rcgen = { version = "*", default-features = false, features = ["aws_lc_rs", "pem"] }
+rust-argon2 = { version = "*", optional = true }
+rustc-hash = "*"
+regex = { version = "1", default-features = false, features = ["std", "perf"] }
+regex-automata = { version = "0.4", default-features = false, features = ["std", "syntax", "meta", "perf"] }
+rustls = "=0.23.46"
+serde = { version = "*", features = ["derive", "std"] }
+serde_json = { version = "*", features = ["preserve_order"] }
+serde_yaml = "*"
+shake = { version = "*", optional = true }
+smoltcp = { version = "*", default-features = false, features = ["std", "log", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-icmp", "auto-icmp-echo-reply", "socket-udp", "socket-tcp", "socket-tcp-cubic", "phy-tuntap_interface", "assembler-max-segment-count-32", "segmentation-offload"] }
+socket2 = { version = "*", features = ["all"] }
+sntpc = { version = "=0.11.0", default-features = false , optional = true }
+subtle = "*"
+tendns = { version = "0.2", default-features = false }
+tokio = { version = "*", features = [
+    "fs",
+    "io-util",
+    "macros",
+    "net",
+    "process",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+tokio-util = { version = "*", features = ["time", "io", "rt"] }
+tracing = { version = "0.1", default-features = false, features = ["release_max_level_info"] }
+tun = { version = "*", features = ["async"] , optional = true }
+url = "*"
+uuid = "1"
+webpki-roots = { version = "*" }
+x509-parser = { version = "*", default-features = false, features = ["verify-aws"] }
+zeroize = "*"
+
+[dev-dependencies]
+h2 = "*"
+tokio = { version = "*", features = ["test-util"] }
+rcgen = { version = "*", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
+shoes-test-support = { path = "tests/support" }
+tempfile = "*"
+tokio-rustls = "*"
+
+[target.'cfg(unix)'.dependencies]
+gotatun = { version = "*", default-features = false, features = ["device", "aws-lc-rs"] }
+
+[target.'cfg(not(target_has_atomic = "64"))'.dependencies]
+portable-atomic = { version = "1", features = ["fallback"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rtnetlink = { version = "0.24", optional = true }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+nftables = "0.6.3"
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+hickory-resolver = { version = "*", default-features = false, features = ["system-config"] }
+
+# jemalloc for better memory performance (not supported on Windows MSVC, iOS, or Android)
+[target.'cfg(not(any(target_env = "msvc", target_os = "ios", target_os = "android")))'.dependencies]
+tikv-jemallocator = "*"
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "*"
+jni = "0.22"
+ndk-sys = "*"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+strip = true
+codegen-units = 1

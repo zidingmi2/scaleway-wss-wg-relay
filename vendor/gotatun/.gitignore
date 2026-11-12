@@ -1,0 +1,9 @@
+target
+**/*.rs.bk
+.vscode/
+.idea/
+result
+.helix/
+.zed/
+.local
+/.direnv

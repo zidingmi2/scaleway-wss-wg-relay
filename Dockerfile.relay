@@ -1,0 +1,70 @@
+# syntax=docker/dockerfile:1
+FROM rust:1.99.1-slim-bookworm@sha256:f2c004e3d2d8b547e8cf7ffbc29205385f4e71d23e53e4e383065db5e9f822cd AS build-base
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources && \
+    apt-get -o Acquire::Retries=5 -o Acquire::https::Timeout=30 update && \
+    apt-get -o Acquire::Retries=5 -o Acquire::https::Timeout=30 install -y --no-install-recommends build-essential cmake git pkg-config && \
+    rm -rf /var/lib/apt/lists/*
+WORKDIR /build
+ENV CARGO_BUILD_JOBS=2 \
+    CARGO_INCREMENTAL=0 \
+    CARGO_PROFILE_DEV_DEBUG=0 \
+    CARGO_PROFILE_TEST_DEBUG=0 \
+    CARGO_NET_GIT_FETCH_WITH_CLI=true \
+    CARGO_HTTP_MULTIPLEXING=false \
+    CARGO_HTTP_TIMEOUT=180 \
+    JEMALLOC_SYS_WITH_MALLOC_CONF="narenas:1,background_thread:false,dirty_decay_ms:1000,muzzy_decay_ms:0" \
+    RUSTFLAGS="-C target-cpu=x86-64"
+COPY Cargo.toml Cargo.lock build.rs rust-toolchain.toml ./
+COPY vendor/ vendor/
+COPY tests/support/ tests/support/
+
+# Compile unchanged dependency graphs once; application edits invalidate only
+# the small final crate, rather than rebuilding all crypto and networking code.
+FROM build-base AS dependencies
+RUN mkdir -p src/bin && \
+    printf '\n' > src/lib.rs && \
+    printf 'fn main() {}\n' > src/main.rs && \
+    printf 'fn main() {}\n' > src/bin/relay-config.rs && \
+    printf '\n' > tests/relay_acceptance.rs
+RUN cargo test --locked --no-default-features --features relay-minimal --lib --bin relay-config --test relay_acceptance --no-run && \
+    cargo build --locked --release --no-default-features --features relay-minimal --bin shoes --bin relay-config
+
+FROM dependencies AS application
+COPY src/ src/
+COPY tests/relay_acceptance.rs tests/relay_acceptance.rs
+COPY tests/cases/wireguard_support.rs tests/cases/wireguard_support.rs
+COPY tests/fixtures/ tests/fixtures/
+COPY benches/ benches/
+ARG SHOES_BUILD_REVISION
+RUN touch src/lib.rs src/main.rs src/bin/relay-config.rs tests/relay_acceptance.rs
+
+# Dependencies are downloaded only at build time. Tests run later with --network none.
+FROM application AS verification
+RUN cargo test --locked --no-default-features --features relay-minimal --lib --bin relay-config --test relay_acceptance --no-run
+ENV RUST_LOG=warn
+CMD ["cargo", "test", "--offline", "--locked", "--no-default-features", "--features", "relay-minimal", "--lib", "--bin", "relay-config", "--test", "relay_acceptance", "--", "--test-threads=1"]
+
+FROM application AS release-build
+RUN cargo build --locked --release --no-default-features --features relay-minimal --bin shoes --bin relay-config
+
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS runtime
+COPY --from=build-base /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=release-build /build/target/release/shoes /usr/local/bin/shoes
+COPY --from=release-build /build/target/release/relay-config /usr/local/bin/relay-config
+COPY LICENSE THIRD_PARTY_NOTICES.md /usr/share/doc/relay/
+COPY licenses/ /usr/share/doc/relay/licenses/
+COPY vendor/gotatun/LICENSE* /usr/share/doc/relay/licenses/gotatun/
+COPY vendor/smoltcp/LICENSE* /usr/share/doc/relay/licenses/smoltcp/
+USER 65532:65532
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/shoes"]
+CMD ["-t", "1", "--no-reload", "--config-env", "RELAY_CONFIG"]
+
+FROM runtime AS acceptance
+USER root
+COPY --from=verification /build/target/debug/deps/relay_acceptance-* /tmp/relay-tests/
+RUN set -eu; mkdir -p /opt/relay-tests; for f in /tmp/relay-tests/*; do if [ -f "$f" ] && [ -x "$f" ]; then cp "$f" /opt/relay-tests/relay_acceptance; fi; done; test -x /opt/relay-tests/relay_acceptance; rm -rf /tmp/relay-tests
+ENV SHOES_TEST_SHOES_BIN=/usr/local/bin/shoes RUST_LOG=warn
+USER 65532:65532
+ENTRYPOINT ["/opt/relay-tests/relay_acceptance"]
+CMD ["--test-threads=1"]

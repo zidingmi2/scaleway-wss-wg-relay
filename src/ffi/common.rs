@@ -1,0 +1,595 @@
+//! Common FFI utilities shared between iOS and Android.
+//!
+//! This module contains platform-independent code that both iOS and Android use.
+
+use std::fs::OpenOptions;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
+
+use log::info;
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
+
+use crate::config::ResolvedConfig;
+use crate::config::{Config, convert_cert_paths, load_config_str};
+use crate::dns::build_dns_registry_for_runtime;
+use crate::logging::{FILE_LOG_FLUSH_TIMEOUT, FileLogWriter, LogWriter};
+use crate::tcp::tcp_server::start_servers;
+#[cfg(unix)]
+use crate::tun::run_tun_from_config;
+
+/// Global log file handle for file-based logging.
+pub static LOG_FILE: OnceLock<parking_lot::Mutex<Option<Arc<FileLogWriter>>>> = OnceLock::new();
+static LOG_FILE_SETUP: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+pub static LOGGER_SETUP: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// Global flag to track if logger has been initialized.
+pub static LOGGER_INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+/// Global state for the TUN service.
+pub static TUN_SERVICE: OnceLock<parking_lot::Mutex<Option<TunServiceHandle>>> = OnceLock::new();
+
+/// Global flag to track initialization.
+pub static INITIALIZED: AtomicBool = AtomicBool::new(false);
+pub static SERVICE_LIFECYCLE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// Handle to a running TUN service.
+pub struct TunServiceHandle {
+    /// Tokio runtime running the service.
+    pub runtime: tokio::runtime::Runtime,
+    /// Channel to signal shutdown.
+    pub shutdown_tx: Option<oneshot::Sender<()>>,
+    /// Flag indicating if service is running.
+    pub running: Arc<AtomicBool>,
+    pub task: JoinHandle<std::io::Result<()>>,
+}
+
+struct ServiceRunGuard {
+    running: Arc<AtomicBool>,
+    #[cfg(unix)]
+    protector: Arc<dyn crate::tun::SocketProtector>,
+}
+
+impl Drop for ServiceRunGuard {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::SeqCst);
+        #[cfg(unix)]
+        crate::tun::clear_global_socket_protector_if_current(&self.protector);
+    }
+}
+
+pub fn spawn_service(
+    runtime: &tokio::runtime::Runtime,
+    config: String,
+    shutdown: oneshot::Receiver<()>,
+    running: Arc<AtomicBool>,
+) -> JoinHandle<std::io::Result<()>> {
+    let guard = ServiceRunGuard {
+        running,
+        #[cfg(unix)]
+        protector: crate::tun::get_global_socket_protector(),
+    };
+    runtime.spawn(async move {
+        let _guard = guard;
+        let result = start_from_config(&config, shutdown).await;
+        if let Err(e) = &result {
+            log::error!("Shoes service failed: {e}");
+        }
+        result
+    })
+}
+
+struct ServerTasks(Vec<JoinHandle<()>>);
+
+impl ServerTasks {
+    async fn stop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+        for task in self.0.drain(..) {
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for ServerTasks {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
+}
+
+/// Set up log file for file-based logging.
+///
+/// Returns 0 on success, -1 on error.
+pub fn setup_log_file(path_str: &str) -> i32 {
+    let _setup = LOG_FILE_SETUP.lock();
+    let file_mutex = LOG_FILE.get_or_init(|| parking_lot::Mutex::new(None));
+    let file = match OpenOptions::new().create(true).append(true).open(path_str) {
+        Ok(file) => file,
+        Err(_) => return -1,
+    };
+    let previous = file_mutex.lock().clone();
+    if let Some(previous) = previous {
+        // Retain a stalled worker and refuse replacement rather than accumulating
+        // uninterruptible threads across repeated set-log-file calls.
+        if previous.shutdown_timeout(FILE_LOG_FLUSH_TIMEOUT).is_err() && !previous.is_finished() {
+            return -1;
+        }
+    }
+    let writer = match FileLogWriter::from_file(file) {
+        Ok(writer) => Arc::new(writer),
+        Err(_) => return -1,
+    };
+    *file_mutex.lock() = Some(writer);
+    info!("Log file set to: {}", path_str);
+    0
+}
+
+/// Write a log message to the log file if configured.
+pub fn write_to_log_file(level: log::Level, target: &str, message: &str) {
+    let writer = LOG_FILE.get().and_then(|slot| slot.lock().clone());
+    if let Some(writer) = writer {
+        writer.write_log(
+            &log::Record::builder().level(level).target(target).build(),
+            &format!("{} [{}] {}", level, target, message),
+        );
+    }
+}
+
+/// Flush the log file.
+pub fn flush_log_file() {
+    let writer = LOG_FILE.get().and_then(|slot| slot.lock().clone());
+    if let Some(writer) = writer {
+        writer.flush();
+    }
+}
+
+/// Stop the TUN service and wait for shutdown.
+///
+/// This is the common shutdown logic used by both iOS and Android.
+pub fn stop_service() -> bool {
+    if !is_lifecycle_thread() {
+        return false;
+    }
+    let _lifecycle = SERVICE_LIFECYCLE.lock();
+    info!("Stopping TUN service");
+
+    let handle = if let Some(service) = TUN_SERVICE.get() {
+        service.lock().take()
+    } else {
+        None
+    };
+
+    if let Some(mut handle) = handle {
+        if let Some(tx) = handle.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+
+        match handle.runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), &mut handle.task).await
+        }) {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => log::error!("TUN service task failed: {e}"),
+            Err(_) => handle.task.abort(),
+        }
+        handle
+            .runtime
+            .shutdown_timeout(std::time::Duration::from_secs(5));
+        handle.running.store(false, Ordering::SeqCst);
+        #[cfg(unix)]
+        crate::tun::clear_global_socket_protector();
+        info!("TUN runtime dropped");
+    }
+
+    info!("TUN service stop completed");
+    // The process-global logger survives stop/start; reuse its single worker.
+    flush_log_file();
+    true
+}
+
+pub fn is_lifecycle_thread() -> bool {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        log::error!("Synchronous service lifecycle calls require a thread outside Tokio");
+        false
+    } else {
+        true
+    }
+}
+
+/// Check if the TUN service is running.
+pub fn is_service_running() -> bool {
+    if let Some(service) = TUN_SERVICE.get() {
+        let guard = service.lock();
+        if let Some(ref handle) = *guard {
+            return handle.running.load(Ordering::SeqCst);
+        }
+    }
+    false
+}
+
+/// Start the service from a config YAML string.
+///
+/// This parses the config YAML and starts both TUN and any Server configs
+/// (like mixed HTTP+SOCKS5 servers) that are defined in the config.
+/// The config YAML must already have device_fd set in the TUN config.
+pub async fn start_from_config(
+    config_yaml: &str,
+    mut shutdown_rx: oneshot::Receiver<()>,
+) -> std::io::Result<()> {
+    info!("Parsing config for TUN server");
+
+    let config_yaml = config_yaml.to_owned();
+    let mut configs: Vec<Config> =
+        tokio::task::spawn_blocking(move || load_config_str(&config_yaml))
+            .await
+            .map_err(std::io::Error::other)??;
+
+    let mut remote_refresh = configs
+        .iter()
+        .any(|config| matches!(config, Config::GlobalSettings(settings) if settings.rule_cache_dir.is_some()));
+    if !remote_refresh {
+        crate::rule_set::visit_sources(&mut configs, &mut |source| {
+            remote_refresh |= source.parsed_url()?.is_some();
+            Ok(())
+        })?;
+    }
+    if remote_refresh {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "remote rule refresh requires the process runtime and is not supported by FFI",
+        ));
+    }
+
+    let (configs, pem_count) = convert_cert_paths(configs).await?;
+    if pem_count > 0 {
+        info!("Loaded {} PEM files", pem_count);
+    }
+
+    let mut validated = crate::config::compile_configs(configs).await?;
+    validated.validate_ffi_support()?;
+    crate::dns::check_interception(&validated.configs, &validated.dns_groups).await?;
+    let mut certificates = crate::certificates::Registry::prepare(&mut validated, None).await?;
+    #[cfg(unix)]
+    let wireguard = crate::wireguard::Prepared::new(&mut validated).await?;
+    let crate::config::ValidatedConfigs {
+        configs: validated_configs,
+        dns_groups,
+        global_limits,
+        ntp,
+        ..
+    } = validated;
+    crate::resources::configure(global_limits)?;
+    let _resource_reporter = crate::resources::ResourceReporter::start();
+
+    // Build DNS registry from expanded groups
+    let synthetic_endpoints: Vec<_> = crate::config::tun_endpoint_ips(&validated_configs).collect();
+    let protect_tun_endpoints = validated_configs.iter().any(
+        |config| matches!(config, ResolvedConfig::TunServer(tun) if tun.dns_hijack == Some(true)),
+    );
+    let mut dns_registry = build_dns_registry_for_runtime(
+        dns_groups,
+        global_limits,
+        None,
+        &synthetic_endpoints,
+        protect_tun_endpoints,
+    )
+    .await?;
+    let dns_snapshots = dns_registry.snapshot_task();
+
+    // Separate TUN config from server configs, validate exactly one TUN with device_fd
+    let mut tun_config = None;
+    let mut server_configs = Vec::new();
+
+    for config in validated_configs {
+        match config {
+            ResolvedConfig::TunServer(tc) => {
+                if tun_config.is_some() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Multiple TUN configs found - only one is allowed for mobile",
+                    ));
+                }
+                if tc.device_fd.is_none() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "TUN config missing device_fd - must be injected by caller",
+                    ));
+                }
+                info!(
+                    "TUN config: fd={}, mtu={}, tcp={}, udp={}, icmp={}",
+                    tc.device_fd.unwrap(),
+                    tc.mtu,
+                    tc.tcp_enabled,
+                    tc.udp_enabled,
+                    tc.icmp_enabled
+                );
+                tun_config = Some(tc);
+            }
+            ResolvedConfig::Server(sc) => {
+                server_configs.push(sc);
+            }
+        }
+    }
+
+    let tun_config = tun_config.ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "No TUN config found")
+    })?;
+
+    let prepared_ntp = crate::ntp::Prepared::new(ntp, None);
+    let mut ntp = tokio::select! {
+        biased;
+        _ = &mut shutdown_rx => return Ok(()),
+        running = prepared_ntp.start(dns_registry.forbidden_ranges().to_vec().into()) => running,
+    };
+
+    #[cfg(unix)]
+    let mut wireguard_running = crate::wireguard::Running::default();
+    #[cfg(unix)]
+    if let Err(error) = wireguard
+        .start(&mut dns_registry, &mut wireguard_running)
+        .await
+    {
+        ntp.stop().await;
+        wireguard_running.stop().await;
+        if let Err(error) = dns_registry.shutdown_checkpoint().await {
+            log::warn!("Final Fake DNS checkpoint failed: {error}");
+        }
+        return Err(error);
+    }
+
+    // Start TCP servers (like mixed)
+    let mut join_handles = ServerTasks(Vec::new());
+
+    for server_config in server_configs {
+        let resolver = dns_registry.get_for_server(server_config.dns.as_ref());
+        match start_servers(ResolvedConfig::Server(server_config), resolver).await {
+            Ok(tasks) => join_handles.0.extend(tasks),
+            Err(error) => {
+                ntp.stop().await;
+                join_handles.stop().await;
+                #[cfg(unix)]
+                wireguard_running.stop().await;
+                if let Err(error) = dns_registry.shutdown_checkpoint().await {
+                    log::warn!("Final Fake DNS checkpoint failed: {error}");
+                }
+                return Err(error);
+            }
+        }
+    }
+
+    certificates.start().await;
+    // Run TUN server (blocks until shutdown). close_fd_on_drop = false because mobile owns the FD
+    #[cfg(unix)]
+    let result = {
+        let resolver = dns_registry.get_for_server(tun_config.dns.as_ref());
+        run_tun_from_config(tun_config, shutdown_rx, false, resolver).await
+    };
+    #[cfg(not(unix))]
+    let result = Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "TUN is not supported on this platform",
+    ));
+
+    // Cleanup any servers when TUN stops
+    ntp.stop().await;
+    join_handles.stop().await;
+    certificates.shutdown().await;
+    #[cfg(unix)]
+    wireguard_running.stop().await;
+
+    drop(dns_snapshots);
+    dns_registry.shutdown_checkpoint().await?;
+
+    result
+}
+
+#[cfg(all(test, unix))]
+#[path = "certificate_tests.rs"]
+mod certificate_tests;
+
+#[cfg(all(test, unix))]
+#[path = "wireguard_tests.rs"]
+mod wireguard_tests;
+
+#[cfg(all(test, unix))]
+#[path = "rule_source_tests.rs"]
+mod rule_source_tests;
+
+#[cfg(all(test, unix))]
+#[path = "ntp_tests.rs"]
+mod ntp_tests;
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixDatagram;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    #[tokio::test]
+    async fn removed_fallback_configuration_is_rejected_before_resources_open() {
+        let (_wire, tun) = UnixDatagram::pair().unwrap();
+        let flags = unsafe { libc::fcntl(tun.as_raw_fd(), libc::F_GETFL) };
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut config = serde_json::json!([
+            {"device_fd": tun.as_raw_fd()},
+            {"address": occupied.local_addr().unwrap().to_string(), "protocol": {"type": "socks"}},
+            {"client_group": "removed", "type": "fallback", "client_proxies": ["direct"]}
+        ]);
+        for check in [
+            None,
+            Some(serde_json::json!({
+                "url": "http://probe.invalid/", "interval_secs": 30
+            })),
+        ] {
+            let expected = if let Some(check) = check {
+                config[2]["health_check"] = check;
+                "unknown field `health_check`"
+            } else {
+                "unknown client group type: fallback"
+            };
+            let (_shutdown, shutdown) = oneshot::channel();
+            let error = start_from_config(&config.to_string(), shutdown)
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains(expected), "{error}");
+            assert_eq!(
+                unsafe { libc::fcntl(tun.as_raw_fd(), libc::F_GETFL) },
+                flags
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn url_test_configuration_is_rejected_without_a_process_supervisor() {
+        let config = r#"
+- client_group: automatic
+  type: url-test
+  url: http://probe.invalid/
+  client_chains: [direct]
+"#;
+        let (_shutdown, shutdown) = oneshot::channel();
+        let error = start_from_config(config, shutdown).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert!(error.to_string().contains("url-test groups"));
+    }
+
+    #[test]
+    fn lifecycle_requires_a_non_runtime_thread() {
+        assert!(is_lifecycle_thread());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            assert!(!is_lifecycle_thread());
+            assert!(!stop_service());
+        });
+        assert!(is_lifecycle_thread());
+    }
+
+    pub(super) fn start_test_service(
+        config: String,
+        protector: Arc<dyn crate::tun::SocketProtector>,
+    ) -> (Arc<AtomicBool>, tokio::task::AbortHandle) {
+        let _lifecycle = SERVICE_LIFECYCLE.lock();
+        crate::tun::set_global_socket_protector(protector);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let running = Arc::new(AtomicBool::new(true));
+        let task = spawn_service(&runtime, config, shutdown_rx, running.clone());
+        let abort_handle = task.abort_handle();
+        *TUN_SERVICE
+            .get_or_init(|| parking_lot::Mutex::new(None))
+            .lock() = Some(TunServiceHandle {
+            runtime,
+            shutdown_tx: Some(shutdown_tx),
+            running: running.clone(),
+            task,
+        });
+        (running, abort_handle)
+    }
+
+    #[test]
+    fn timed_out_service_cannot_clear_replacement_socket_protector() {
+        if std::env::var_os("SHOES_FFI_RESTART_TEST_CHILD").is_none() {
+            shoes_test_support::isolated::run_isolated(
+                "ffi::common::tests::timed_out_service_cannot_clear_replacement_socket_protector",
+                "SHOES_FFI_RESTART_TEST_CHILD",
+                "1",
+            );
+            return;
+        }
+        let (_old_peer, old_fd) = UnixDatagram::pair().unwrap();
+        let (_new_peer, new_fd) = UnixDatagram::pair().unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = parking_lot::Mutex::new(release_rx);
+        let old_protector = Arc::new(crate::tun::FnSocketProtector::new(move |_| {
+            entered_tx.send(()).unwrap();
+            release_rx
+                .lock()
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap();
+            Ok(())
+        }));
+        let old_config = format!(
+            r#"
+- device_fd: {}
+  rules:
+    - masks: "0.0.0.0/0"
+      action: allow
+      client_chain:
+        - address: "127.0.0.1:9"
+          transport: quic
+          quic_settings:
+            verify: false
+          protocol:
+            type: socks
+"#,
+            old_fd.as_raw_fd(),
+        );
+        let (old_running, old_task) = start_test_service(old_config, old_protector);
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let started = Instant::now();
+        stop_service();
+        assert!(started.elapsed() >= Duration::from_secs(9));
+        assert!(!old_running.load(Ordering::SeqCst));
+        assert!(!is_service_running());
+        assert_eq!(
+            crate::tun::protect_socket(-1).unwrap_err().kind(),
+            std::io::ErrorKind::NotConnected,
+        );
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = calls.clone();
+        let protector = Arc::new(crate::tun::FnSocketProtector::new(move |_| {
+            callback_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }));
+        let config = format!("- device_fd: {}\n", new_fd.as_raw_fd());
+        let (new_running, _) = start_test_service(config, protector);
+        crate::tun::protect_socket(-1).unwrap();
+        release_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !old_task.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "old service did not finish after release"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let protection = crate::tun::protect_socket(-1);
+        let replacement_running = is_service_running();
+        stop_service();
+        assert!(replacement_running);
+        assert!(
+            protection.is_ok(),
+            "old cleanup removed the replacement protector: {protection:?}"
+        );
+        assert!(calls.load(Ordering::SeqCst) >= 2);
+        assert!(!new_running.load(Ordering::SeqCst));
+        assert_eq!(
+            crate::tun::protect_socket(-1).unwrap_err().kind(),
+            std::io::ErrorKind::NotConnected,
+        );
+
+        let (failed_running, _) =
+            start_test_service("[]".into(), Arc::new(crate::tun::NoOpSocketProtector));
+        let handle = TUN_SERVICE.get().unwrap().lock().take().unwrap();
+        assert!(handle.runtime.block_on(handle.task).unwrap().is_err());
+        assert!(!failed_running.load(Ordering::SeqCst));
+        assert_eq!(
+            crate::tun::protect_socket(-1).unwrap_err().kind(),
+            std::io::ErrorKind::NotConnected,
+        );
+    }
+}
