@@ -92,3 +92,16 @@ direct-egress configuration as a rollback.
 
 All upstream and vendored license notices are retained in the source tree and
 included in the runtime image.
+
+## Explicit direct egress
+
+Set `global_settings.relay_egress` to `direct` and use `client_chain: "direct"`
+for the allowed ingress routes and DNS servers to send traffic directly from
+Scaleway. Remove all WireGuard client/server definitions. Direct mode rejects
+WireGuard definitions, including unused ones; an omitted mode retains the
+WireGuard-only ingress policy for existing configurations.
+
+Keep authentication, the WebSocket path, and private/reserved/IPv6 destination
+blocks when changing egress. The platform's region becomes the egress location;
+the former WireGuard exit IP no longer applies. Direct UDP replies are accepted
+only from the selected destination address and port.

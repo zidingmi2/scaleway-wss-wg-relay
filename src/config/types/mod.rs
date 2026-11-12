@@ -41,7 +41,7 @@ pub use client::{
 };
 pub use common::DEFAULT_REALITY_SHORT_ID;
 pub use dns::{DnsConfig, DnsConfigGroup, DnsServerSpec, ExpandedDnsGroup, ExpandedDnsSpec};
-pub use global::{GlobalLimits, GlobalSettings};
+pub use global::{GlobalLimits, GlobalSettings, RelayEgress};
 pub use groups::{
     ClientConfigGroup, ClientGroupMember, Config, GroupType, NamedPem, PemSource, RuleSourceGroup,
     UrlTestConfig,

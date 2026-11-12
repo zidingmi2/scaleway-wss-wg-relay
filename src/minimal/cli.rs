@@ -46,7 +46,7 @@ fn run() -> io::Result<()> {
             }
             "-h" | "--help" => {
                 println!(
-                    "shoes --config-env RELAY_CONFIG [-t 1] [--no-reload] [--check]\nshoes check CONFIG.json\nThis build supports Trojan/WebSocket and WireGuard only."
+                    "shoes --config-env RELAY_CONFIG [-t 1] [--no-reload] [--check]\nshoes check CONFIG.json\nThis build supports Trojan/WebSocket with WireGuard or explicit direct egress.\nSet global_settings.relay_egress to direct to disable WireGuard definitions and require direct-only routes; the default is wireguard."
                 );
                 return Ok(());
             }
