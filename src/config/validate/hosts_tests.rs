@@ -167,7 +167,7 @@ fn hosts_reject_hijacked_tun_endpoints_without_fake_dns() {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(feature = "relay-minimal")))]
 #[test]
 fn hosts_reject_managed_tun_endpoints_without_fake_dns() {
     for ip in ["10.233.0.1", "::ffff:10.233.0.1", "fd73::1"] {
