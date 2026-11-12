@@ -1,6 +1,9 @@
 # syntax=docker/dockerfile:1
 FROM rust:1.99.1-slim-bookworm@sha256:f2c004e3d2d8b547e8cf7ffbc29205385f4e71d23e53e4e383065db5e9f822cd AS build-base
-RUN apt-get update && apt-get install -y --no-install-recommends build-essential cmake git pkg-config && rm -rf /var/lib/apt/lists/*
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources && \
+    apt-get -o Acquire::Retries=5 -o Acquire::https::Timeout=30 update && \
+    apt-get -o Acquire::Retries=5 -o Acquire::https::Timeout=30 install -y --no-install-recommends build-essential cmake git pkg-config && \
+    rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 ENV CARGO_BUILD_JOBS=2 \
     CARGO_NET_GIT_FETCH_WITH_CLI=true \
@@ -42,7 +45,7 @@ FROM application AS release-build
 RUN cargo build --locked --release --no-default-features --features relay-minimal --bin shoes --bin relay-config
 
 FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS runtime
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=build-base /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=release-build /build/target/release/shoes /usr/local/bin/shoes
 COPY --from=release-build /build/target/release/relay-config /usr/local/bin/relay-config
 COPY LICENSE THIRD_PARTY_NOTICES.md /usr/share/doc/relay/
