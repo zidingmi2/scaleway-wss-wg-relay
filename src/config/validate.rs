@@ -36,7 +36,10 @@ fn minimal_unsupported(capability: &str) -> std::io::Error {
 }
 
 #[cfg(feature = "relay-minimal")]
-fn validate_minimal_capabilities(configs: &mut [Config]) -> std::io::Result<()> {
+fn validate_minimal_capabilities(
+    configs: &mut [Config],
+    egress: super::RelayEgress,
+) -> std::io::Result<()> {
     // Reject removed capabilities before certificate/rule preparation can read
     // files or create any network dependencies. Keeping their schema variants
     // permits an explicit error instead of silently ignoring an option.
@@ -67,7 +70,16 @@ fn validate_minimal_capabilities(configs: &mut [Config]) -> std::io::Result<()> 
                     return Err(minimal_unsupported("client selection or health probes"));
                 }
             }
-            Config::Server(server) => validate_minimal_server(server)?,
+            Config::Server(server) => {
+                if egress == super::RelayEgress::Direct
+                    && matches!(server.protocol, ServerProxyConfig::Wireguard(_))
+                {
+                    return Err(minimal_unsupported(
+                        "WireGuard definitions in direct-egress mode",
+                    ));
+                }
+                validate_minimal_server(server)?;
+            }
             Config::DnsConfigGroup(group) if group.fake_ip.is_some() => {
                 return Err(minimal_unsupported("fake-IP DNS"));
             }
@@ -78,6 +90,13 @@ fn validate_minimal_capabilities(configs: &mut [Config]) -> std::io::Result<()> 
         Err(minimal_unsupported("file or remote rule sources"))
     })?;
     super::client_visit::visit_source_configs(configs, &mut |client| {
+        if egress == super::RelayEgress::Direct
+            && !matches!(client.protocol, ClientProxyConfig::Direct)
+        {
+            return Err(minimal_unsupported(
+                "non-direct outbound in direct-egress mode",
+            ));
+        }
         validate_minimal_client(client)
     })
 }
@@ -154,15 +173,47 @@ fn validate_minimal_stream_protocol(protocol: &ServerProxyConfig) -> std::io::Re
 }
 
 #[cfg(feature = "relay-minimal")]
-fn validate_minimal_ingress_routes(rules: &NoneOrSome<ResolvedRuleConfig>) -> std::io::Result<()> {
+fn validate_minimal_ingress_routes(
+    rules: &NoneOrSome<ResolvedRuleConfig>,
+    egress: super::RelayEgress,
+) -> std::io::Result<()> {
     for rule in rules.iter() {
         if let ResolvedRuleActionConfig::Allow { client_chains, .. } = &rule.action
             && (client_chains.is_empty()
-                || client_chains
-                    .iter()
-                    .any(|chain| !chain_uses_wireguard(chain)))
+                || client_chains.iter().any(|chain| match egress {
+                    super::RelayEgress::Wireguard => !chain_uses_wireguard(chain),
+                    super::RelayEgress::Direct => !super::composition::direct_only(&chain.hops),
+                }))
         {
-            return Err(minimal_unsupported("Trojan ingress direct-egress route"));
+            return Err(minimal_unsupported(match egress {
+                super::RelayEgress::Wireguard => "Trojan ingress direct-egress route",
+                super::RelayEgress::Direct => "non-direct ingress route in direct-egress mode",
+            }));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "relay-minimal")]
+fn validate_minimal_resolved_routes(
+    configs: &[ResolvedConfig],
+    egress: super::RelayEgress,
+) -> std::io::Result<()> {
+    for config in configs {
+        let ResolvedConfig::Server(server) = config else {
+            continue;
+        };
+        // A WireGuard server's explicit forwarding rules belong to the peer
+        // side of the tunnel, not to Trojan ingress. Direct mode rejects this
+        // server type before any endpoint preparation.
+        if matches!(server.protocol, ResolvedServerProxyConfig::Wireguard(_)) {
+            continue;
+        }
+        validate_minimal_ingress_routes(&server.rules, egress)?;
+        if let ResolvedServerProxyConfig::Websocket { targets } = &server.protocol {
+            for target in targets.iter() {
+                validate_minimal_ingress_routes(&target.override_rules, egress)?;
+            }
         }
     }
     Ok(())
@@ -231,7 +282,15 @@ pub(super) fn create_server_configs_with_memory(
     memory: Option<crate::rule_set::MemorySources>,
 ) -> std::io::Result<ValidatedConfigs> {
     #[cfg(feature = "relay-minimal")]
-    validate_minimal_capabilities(&mut all_configs)?;
+    let relay_egress = all_configs
+        .iter()
+        .find_map(|config| match config {
+            Config::GlobalSettings(settings) => Some(settings.relay_egress),
+            _ => None,
+        })
+        .unwrap_or_default();
+    #[cfg(feature = "relay-minimal")]
+    validate_minimal_capabilities(&mut all_configs, relay_egress)?;
     crate::rule_set::validate_remote_paths(&mut all_configs, &[])?;
     let rule_cache_dir = crate::rule_set::cache_directory(&all_configs)?;
 
@@ -575,6 +634,8 @@ pub(super) fn create_server_configs_with_memory(
         validate_dns_group_ref(&dns, &group_names, "server config")?;
         result.push(ResolvedConfig::TunServer(config));
     }
+    #[cfg(feature = "relay-minimal")]
+    validate_minimal_resolved_routes(&result, relay_egress)?;
     crate::desktop::validate_config(&result)?;
     if result
         .iter()
@@ -1525,8 +1586,6 @@ fn resolve_server_config(
             global_limits,
         )
     })?;
-    #[cfg(feature = "relay-minimal")]
-    validate_minimal_ingress_routes(&rules)?;
     let protocol = resolve_server_proxy_config(
         server_config.protocol,
         client_groups,
@@ -2382,7 +2441,6 @@ fn resolve_server_proxy_config(
                 )?;
                 let override_rules =
                     resolve_rules(config.override_rules, groups, rules, pems, limits)?;
-                validate_minimal_ingress_routes(&override_rules)?;
                 Ok::<_, std::io::Error>(ResolvedWebsocketServerConfig {
                     matching_path: config.matching_path,
                     matching_headers: config.matching_headers,
@@ -3050,5 +3108,78 @@ mod minimal_tests {
             let error = validate(json!([entry])).err().unwrap();
             assert_eq!(error.kind(), std::io::ErrorKind::Unsupported, "{error}");
         }
+    }
+
+    fn direct_mode() -> Value {
+        json!({"global_settings":{"relay_egress":"direct"}})
+    }
+
+    fn direct_listener() -> Value {
+        let mut server = listener(json!({"type":"websocket", "targets":[{
+            "matching_path":"/relay/offline",
+            "protocol":{"type":"trojan","password":["offline-one","offline-two"]},
+            "override_rules":"allow-all-direct"
+        }]}));
+        server["rules"] = json!("allow-all-direct");
+        server
+    }
+
+    fn unused_wireguard() -> Value {
+        json!({"client_group":"unused-vpn", "client_chain":{
+            "address":"192.0.2.1:51820", "protocol":{
+                "type":"wireguard",
+                "private_key":"KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio=",
+                "public_key":"F9firNML9eGdhhroCYjRf66PZi9dgLAFP2zHPNqx0mQ=",
+                "addresses":["10.77.0.2/32"]
+            }
+        }})
+    }
+
+    #[test]
+    fn direct_mode_accepts_direct_routes_without_creating_wireguard_endpoints() {
+        let result = validate(json!([direct_mode(), direct_listener()])).unwrap();
+        assert_eq!(result.configs.len(), 1);
+        assert!(result.wireguard_endpoints.is_empty());
+        // The mode is scoped to this configuration, never a process-global switch.
+        assert!(validate(json!([direct_listener()])).is_err());
+        assert!(validate(json!([direct_listener(), direct_mode()])).is_ok());
+    }
+
+    #[test]
+    fn direct_mode_rejects_wireguard_even_in_unused_definitions() {
+        let error = validate(json!([
+            direct_mode(),
+            unused_wireguard(),
+            direct_listener()
+        ]))
+        .err()
+        .unwrap();
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert!(error.to_string().contains("non-direct outbound"));
+
+        let server = json!({"address":"127.0.0.1:51820", "protocol":{
+            "type":"wireguard",
+            "private_key":"KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio=",
+            "addresses":["10.77.0.1/32"],"peers":[]
+        }, "rules":"block-all"});
+        let error = validate(json!([direct_mode(), server])).err().unwrap();
+        assert!(error.to_string().contains("WireGuard definitions"));
+    }
+
+    #[test]
+    fn direct_mode_rejects_proxy_chains_and_checks_websocket_overrides() {
+        let mut server = direct_listener();
+        server["protocol"]["targets"][0]["override_rules"] = json!([{
+            "masks":"0.0.0.0/0", "action":"allow", "client_chain":{
+                "address":"192.0.2.2:1080", "protocol":{"type":"socks"}
+            }
+        }]);
+        assert!(validate(json!([direct_mode(), server])).is_err());
+
+        let mut server = direct_listener();
+        server["protocol"]["targets"][0]["override_rules"] = json!([{
+            "masks":"0.0.0.0/0", "action":"allow", "client_chain":"unused-vpn"
+        }]);
+        assert!(validate(json!([direct_mode(), unused_wireguard(), server])).is_err());
     }
 }

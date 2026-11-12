@@ -1,5 +1,21 @@
 use serde::{Deserialize, Serialize};
 
+/// Explicit egress policy for the dedicated relay profile. An omitted setting
+/// keeps the original WireGuard-only ingress contract.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayEgress {
+    #[default]
+    Wireguard,
+    Direct,
+}
+
+impl RelayEgress {
+    pub fn is_wireguard(&self) -> bool {
+        *self == Self::Wireguard
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct GlobalSettings {
     #[serde(flatten)]
@@ -10,6 +26,8 @@ pub struct GlobalSettings {
     pub default_dns: Option<super::dns::DnsConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ntp: Option<super::ntp::NtpConfig>,
+    #[serde(skip_serializing_if = "RelayEgress::is_wireguard")]
+    pub relay_egress: RelayEgress,
 }
 
 impl<'de> Deserialize<'de> for GlobalSettings {
@@ -31,12 +49,17 @@ impl<'de> Deserialize<'de> for GlobalSettings {
             Some(value) => serde_yaml::from_value(value).map_err(Error::custom)?,
             None => None,
         };
+        let relay_egress = match fields.remove("relay_egress") {
+            Some(value) => serde_yaml::from_value(value).map_err(Error::custom)?,
+            None => RelayEgress::default(),
+        };
         let limits = serde_yaml::from_value(Value::Mapping(fields)).map_err(Error::custom)?;
         Ok(Self {
             limits,
             rule_cache_dir,
             default_dns,
             ntp,
+            relay_egress,
         })
     }
 }
@@ -156,6 +179,39 @@ impl GlobalLimits {
 mod tests {
     use super::*;
     use crate::config::{Config, create_server_configs};
+
+    #[test]
+    fn relay_egress_is_explicit_and_strict() {
+        let default: GlobalSettings = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(default.relay_egress, RelayEgress::Wireguard);
+        assert!(
+            serde_json::to_value(default)
+                .unwrap()
+                .get("relay_egress")
+                .is_none()
+        );
+        let direct: GlobalSettings = serde_json::from_value(serde_json::json!({
+            "relay_egress": "direct"
+        }))
+        .unwrap();
+        assert_eq!(direct.relay_egress, RelayEgress::Direct);
+        assert_eq!(
+            serde_json::to_value(direct).unwrap()["relay_egress"],
+            "direct"
+        );
+        for invalid in [
+            serde_json::json!(null),
+            serde_json::json!("automatic"),
+            serde_json::json!(true),
+        ] {
+            assert!(
+                serde_json::from_value::<GlobalSettings>(serde_json::json!({
+                    "relay_egress": invalid
+                }))
+                .is_err()
+            );
+        }
+    }
 
     #[test]
     fn omitted_and_empty_limits_are_unlimited() {

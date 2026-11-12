@@ -193,7 +193,7 @@ impl SocketConnector for SocketConnectorImpl {
         mut target: ResolvedLocation,
     ) -> std::io::Result<Box<dyn crate::async_stream::AsyncMessageStream>> {
         let address = resolve_location(&mut target, resolver).await?;
-        Ok(Box::new(UnconnectedUdpSocket::new(
+        Ok(Box::new(PinnedUdpSocket::new(
             new_udp_socket(address.is_ipv6(), self.bind_interface.clone())?,
             address,
         )))
@@ -202,14 +202,15 @@ impl SocketConnector for SocketConnectorImpl {
         self.bind_interface.as_deref()
     }
 }
-/// A UDP socket wrapper that tracks the destination and uses send_to/recv_from.
-/// Unlike a connected UDP socket, this accepts incoming packets from any source.
-struct UnconnectedUdpSocket {
+/// A bidirectional UDP association pinned to the already validated destination.
+/// Keep the carrier's send_to/recv_from socket behavior, but never forward a packet
+/// from a different peer as if it came from this association's target.
+struct PinnedUdpSocket {
     socket: UdpSocket,
     destination: SocketAddr,
 }
 
-impl UnconnectedUdpSocket {
+impl PinnedUdpSocket {
     fn new(socket: UdpSocket, destination: SocketAddr) -> Self {
         Self {
             socket,
@@ -218,7 +219,24 @@ impl UnconnectedUdpSocket {
     }
 }
 
-impl crate::async_stream::AsyncReadMessage for UnconnectedUdpSocket {
+fn udp_source_matches(source: SocketAddr, destination: SocketAddr) -> bool {
+    if source.port() != destination.port()
+        || source.ip().to_canonical() != destination.ip().to_canonical()
+    {
+        return false;
+    }
+    match (source, destination) {
+        (SocketAddr::V6(source), SocketAddr::V6(destination))
+            if source.ip().to_ipv4_mapped().is_none() =>
+        {
+            // Interface scope is part of a native IPv6 endpoint's identity.
+            source.scope_id() == destination.scope_id()
+        }
+        _ => true,
+    }
+}
+
+impl crate::async_stream::AsyncReadMessage for PinnedUdpSocket {
     fn read_message_eof_on_empty(&self) -> bool {
         false
     }
@@ -228,23 +246,28 @@ impl crate::async_stream::AsyncReadMessage for UnconnectedUdpSocket {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        match this.socket.poll_recv_from(cx, buf) {
-            Poll::Ready(Ok(addr)) => {
-                log::debug!(
-                    "[UnconnectedUdp] Received {} bytes from {} (target: {})",
-                    buf.filled().len(),
-                    addr,
-                    this.destination
-                );
-                Poll::Ready(Ok(()))
+        let original_filled = buf.filled().len();
+        for _ in 0..32 {
+            match this.socket.poll_recv_from(cx, buf) {
+                Poll::Ready(Ok(source)) if udp_source_matches(source, this.destination) => {
+                    return Poll::Ready(Ok(()));
+                }
+                Poll::Ready(Ok(_)) => {
+                    // Discard the entire unsolicited datagram without allocating another
+                    // receive buffer or logging attacker-controlled packet metadata.
+                    buf.set_filled(original_filled);
+                }
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
             }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Pending => Poll::Pending,
         }
+        // A stream of unsolicited packets must not monopolize the single worker.
+        cx.waker().wake_by_ref();
+        Poll::Pending
     }
 }
 
-impl crate::async_stream::AsyncWriteMessage for UnconnectedUdpSocket {
+impl crate::async_stream::AsyncWriteMessage for PinnedUdpSocket {
     fn poll_write_message(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -253,11 +276,22 @@ impl crate::async_stream::AsyncWriteMessage for UnconnectedUdpSocket {
         let this = self.get_mut();
         this.socket
             .poll_send_to(cx, buf, this.destination)
-            .map(|r| r.map(|_| ()))
+            .map(|result| {
+                result.and_then(|written| {
+                    if written == buf.len() {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::WriteZero,
+                            "incomplete UDP datagram send",
+                        ))
+                    }
+                })
+            })
     }
 }
 
-impl crate::async_stream::AsyncFlushMessage for UnconnectedUdpSocket {
+impl crate::async_stream::AsyncFlushMessage for PinnedUdpSocket {
     fn poll_flush_message(
         self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
@@ -266,7 +300,7 @@ impl crate::async_stream::AsyncFlushMessage for UnconnectedUdpSocket {
     }
 }
 
-impl crate::async_stream::AsyncShutdownMessage for UnconnectedUdpSocket {
+impl crate::async_stream::AsyncShutdownMessage for PinnedUdpSocket {
     fn poll_shutdown_message(
         self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
@@ -275,7 +309,7 @@ impl crate::async_stream::AsyncShutdownMessage for UnconnectedUdpSocket {
     }
 }
 
-impl crate::async_stream::AsyncPing for UnconnectedUdpSocket {
+impl crate::async_stream::AsyncPing for PinnedUdpSocket {
     fn supports_ping(&self) -> bool {
         false
     }
@@ -285,4 +319,40 @@ impl crate::async_stream::AsyncPing for UnconnectedUdpSocket {
     }
 }
 
-impl crate::async_stream::AsyncMessageStream for UnconnectedUdpSocket {}
+impl crate::async_stream::AsyncMessageStream for PinnedUdpSocket {}
+
+#[cfg(test)]
+mod udp_source_tests {
+    use super::udp_source_matches;
+    use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
+
+    #[test]
+    fn only_the_pinned_udp_endpoint_can_reply() {
+        let target = "192.0.2.1:53".parse().unwrap();
+        for source in ["192.0.2.1:53", "[::ffff:192.0.2.1]:53"] {
+            assert!(udp_source_matches(source.parse().unwrap(), target));
+        }
+        for source in [
+            "192.0.2.2:53",
+            "192.0.2.1:54",
+            "[::ffff:192.0.2.2]:53",
+            "[2001:db8::1]:53",
+        ] {
+            assert!(!udp_source_matches(source.parse().unwrap(), target));
+        }
+    }
+
+    #[test]
+    fn native_ipv6_scope_is_not_interchangeable() {
+        let ip: Ipv6Addr = "fe80::1".parse().unwrap();
+        let target = SocketAddr::V6(SocketAddrV6::new(ip, 51820, 0, 3));
+        assert!(udp_source_matches(
+            SocketAddr::V6(SocketAddrV6::new(ip, 51820, 7, 3)),
+            target
+        ));
+        assert!(!udp_source_matches(
+            SocketAddr::V6(SocketAddrV6::new(ip, 51820, 0, 4)),
+            target
+        ));
+    }
+}
