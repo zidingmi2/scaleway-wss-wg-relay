@@ -875,6 +875,7 @@ fn run(
             let socket = sockets.get_mut::<TcpSocket>(*handle);
             entry.pump(*handle, socket, now());
         }
+        let mut udp_idle_deadline: Option<std::time::Instant> = None;
         udp.retain(|_, entry| {
             let mut control = entry.0.lock();
             if control.closed {
@@ -886,7 +887,18 @@ fn run(
             if let Some(writer) = control.writer.take() {
                 writer.wake();
             }
-            !control.reap_if_expired()
+            if control.reap_if_expired() {
+                return false;
+            }
+            // Reuse the flow lock held for draining/reaping. Keep an absolute
+            // deadline so the remaining work in this round cannot extend idle
+            // lifetimes, and no second UDP table scan is needed before sleep.
+            if let Some(deadline) = control.idle_deadline() {
+                udp_idle_deadline = Some(
+                    udp_idle_deadline.map_or(deadline, |earliest| earliest.min(deadline)),
+                );
+            }
+            true
         });
         for _ in 0..QUEUE_CAPACITY {
             let Ok(packet) = replies.try_recv() else {
@@ -923,12 +935,16 @@ fn run(
             iface.poll_delay(timestamp, &sockets),
             tcp.values().map(|entry| &*entry.control),
         );
-        let expired = reassembler.expire(std::time::Instant::now());
+        let idle_now = std::time::Instant::now();
+        let expired = reassembler.expire(idle_now);
         device.drops.fetch_add(expired as u64, Ordering::Relaxed);
         let delay = delay
             .map(Into::<Duration>::into)
             .into_iter()
-            .chain(reassembler.next_delay(std::time::Instant::now()))
+            .chain(reassembler.next_delay(idle_now))
+            .chain(udp_idle_deadline.map(|deadline| {
+                deadline.saturating_duration_since(std::time::Instant::now())
+            }))
             .min();
         let delay = output_backpressure_delay(output_full, delay);
         if let Err(error) = wake_rx.wait(-1, delay)

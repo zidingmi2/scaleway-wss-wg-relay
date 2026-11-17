@@ -39,6 +39,12 @@ fix despite sharing the package version. The git workspace also splits out
 the corresponding source links in `THIRD_PARTY_NOTICES.md`. Shoes keeps AWS-LC
 and uses its own conditional atomic imports on targets without 64-bit atomics.
 
+The relay's vendored receive path releases the peer mutex and device read lock
+after decryption and the allowed-IP ownership check, before awaiting bounded
+IP delivery. This prevents a full receive queue from holding the peer lock
+needed to drain outgoing traffic. The independent packet remains ordered by
+the same receive task; handshake handling and packet authentication are unchanged.
+
 ### Hickory
 
 The stable base remains [v0.26.3](https://github.com/hickory-dns/hickory-dns/releases/tag/v0.26.3),

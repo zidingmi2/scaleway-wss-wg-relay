@@ -814,6 +814,12 @@ impl<T: DeviceTransports> DeviceState<T> {
                         continue;
                     }
 
+                    // The authenticated packet is now owned independently of
+                    // the peer and has passed the allowed-IP ownership check.
+                    // A bounded IP sink can block while its stack waits for
+                    // outgoing traffic, which needs this same peer lock.
+                    drop(peer);
+                    drop(device_guard);
                     if let Err(e) = tun_tx.send(packet).await {
                         tracing::trace!("buffered_tun_send.send failed");
                         return Err(Error::IoError(e));

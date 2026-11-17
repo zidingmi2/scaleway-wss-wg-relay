@@ -382,6 +382,131 @@ async fn udp_exchange(
     ))
 }
 
+const CAPACITY: usize = 80;
+
+fn report_capacity_memory(pid: u32) {
+    #[cfg(target_os = "macos")]
+    {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
+        // The V4 flavor writes a rusage_info_v4 to the caller's buffer.
+        let result = unsafe {
+            libc::proc_pid_rusage(pid as i32, libc::RUSAGE_INFO_V4, usage.as_mut_ptr().cast())
+        };
+        if result == 0 {
+            let usage = unsafe { usage.assume_init() };
+            eprintln!("capacity relay peak_phys_footprint_bytes={}", usage.ri_lifetime_max_phys_footprint);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    if let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status"))
+        && let Some(peak) = status.lines().find_map(|line| line.strip_prefix("VmHWM:"))
+    {
+        eprintln!("capacity relay peak_rss={}", peak.trim());
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let _ = pid;
+}
+
+async fn start_pair(dns1: u16, dns2: u16) -> io::Result<(Process, Process, u16)> {
+    let peer_reservation = std::net::UdpSocket::bind("127.0.0.1:0")?;
+    let peer_port = peer_reservation.local_addr()?.port();
+    let ws_reservation = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let ws_port = ws_reservation.local_addr()?.port();
+    let (peer_key, peer_public) = keypair()?;
+    let (client_key, client_public) = keypair()?;
+    let limits = json!({
+        "tcp_buffer_size": 32768, "tcp_buffer_max_size": 4 * 1024 * 1024,
+        "tcp_memory_bytes": 48 * 1024 * 1024, "max_tcp_connections": CAPACITY,
+        "max_udp_queued_bytes": 8 * 1024 * 1024
+    });
+    let peer = json!([{
+        "address":format!("127.0.0.1:{peer_port}"),
+        "protocol":{"type":"wireguard", "wireguard_name":"offline-peer", "private_key":peer_key,
+            "addresses":["10.77.0.1/32"], "mtu":1420, "resource_limits":limits,
+            "peers":[{"public_key":client_public,"allowed_ips":["10.77.0.2/32"]}]},
+        // The peer maps every inner IPv4 target to loopback. This also makes a
+        // client-side private-address policy regression observable by a local trap.
+        "rules":[{"masks":"0.0.0.0/0","action":"allow","override_address":"127.0.0.1:0"}]
+    }]);
+    let proxy = json!([
+        {"global_settings":{"max_connections":CAPACITY, "max_streams":CAPACITY,"default_dns":{"servers":"wg-dns"}}},
+        {"dns_group":"wg-dns", "dns_servers":[
+            {"url":format!("udp://9.9.9.9:{dns1}"),"client_chain":"wg","ip_strategy":"ipv4_only","timeout_secs":2},
+            {"url":format!("udp://9.9.9.9:{dns2}"),"client_chain":"wg","ip_strategy":"ipv4_only","timeout_secs":2}
+        ]},
+        {"client_group":"wg", "client_chains":[{"address":format!("127.0.0.1:{peer_port}"),
+            "protocol":{"type":"wireguard","private_key":client_key,"public_key":peer_public,
+                "addresses":["10.77.0.2/32"],"allowed_ips":["0.0.0.0/0"],"mtu":1420,"resource_limits":limits}}]},
+        {"address":format!("127.0.0.1:{ws_port}"),"protocol":ws_protocol(),"dns":{"servers":"wg-dns"},"rules":policy()}
+    ]);
+    drop(peer_reservation);
+    let mut peer = Process::start(peer)?;
+    drop(ws_reservation);
+    let mut proxy = Process::start(proxy)?;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            peer.ensure_running()?; proxy.ensure_running()?;
+            if TcpStream::connect((Ipv4Addr::LOCALHOST, ws_port)).await.is_ok() { return Ok::<_,io::Error>(()); }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }).await??;
+    Ok((proxy, peer, ws_port))
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn eighty_active_tcp_flows_roundtrip_through_wireguard() -> io::Result<()> {
+    use futures::{StreamExt, TryStreamExt, stream};
+
+    tokio::time::timeout(Duration::from_secs(90), async {
+        let (tcp_port, connections, _echo) = tcp_echo().await?;
+        let (dns1, _, _dns1) = dns_stub().await?;
+        let (dns2, _, _dns2) = dns_stub().await?;
+        let (mut proxy, mut peer, ws_port) = start_pair(dns1, dns2).await?;
+        let open = stream::iter(0..CAPACITY)
+            .map(|id| async move {
+                let (mut writer, mut reader) = websocket(ws_port, PATH).await?;
+                let mut header = request(OWNER, 1, "9.9.9.9", tcp_port);
+                header.push(id as u8);
+                writer.send(&header).await?;
+                assert_eq!(reader.bytes(1).await?, [id as u8]);
+                Ok::<_, io::Error>((id, writer, reader))
+            })
+            .buffer_unordered(8)
+            .try_collect::<Vec<_>>();
+        let flows = tokio::time::timeout(Duration::from_secs(40), open).await.map_err(|_| {
+            io::Error::new(io::ErrorKind::TimedOut, format!(
+                "capacity setup timed out after {} echo connections", connections.load(Ordering::Relaxed)
+            ))
+        })??;
+        assert_eq!(connections.load(Ordering::Relaxed), CAPACITY);
+        eprintln!("capacity: all {CAPACITY} flows have verified their first byte");
+
+        // All streams are established and retained until this simultaneous burst.
+        let finished = AtomicUsize::new(0);
+        let transfer = stream::iter(flows)
+            .map(|(id, mut writer, mut reader)| {
+                let finished = &finished;
+                async move {
+                    let payload = vec![id as u8; 16 * 1024];
+                    writer.send(&payload).await?;
+                    assert_eq!(reader.bytes(payload.len()).await?, payload);
+                    finished.fetch_add(1, Ordering::Relaxed);
+                    writer.0.shutdown().await
+                }
+            })
+            .buffer_unordered(CAPACITY)
+            .try_collect::<Vec<_>>();
+        tokio::time::timeout(Duration::from_secs(45), transfer).await.map_err(|_| {
+            io::Error::new(io::ErrorKind::TimedOut, format!(
+                "capacity burst timed out after {} echoes", finished.load(Ordering::Relaxed)
+            ))
+        })??;
+        report_capacity_memory(proxy.child.id());
+        proxy.ensure_running()?;
+        peer.ensure_running()
+    }).await?
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn production_binary_websocket_trojan_wireguard_contract() -> io::Result<()> {
     tokio::time::timeout(Duration::from_secs(120), async {
@@ -389,44 +514,7 @@ async fn production_binary_websocket_trojan_wireguard_contract() -> io::Result<(
         let (udp_port, _udp) = udp_echo().await?;
         let (dns1, dns_count1, _dns1) = dns_stub().await?;
         let (dns2, dns_count2, _dns2) = dns_stub().await?;
-        let peer_reservation = std::net::UdpSocket::bind("127.0.0.1:0")?;
-        let peer_port = peer_reservation.local_addr()?.port();
-        let ws_reservation = std::net::TcpListener::bind("127.0.0.1:0")?;
-        let ws_port = ws_reservation.local_addr()?.port();
-        let (peer_key, peer_public) = keypair()?;
-        let (client_key, client_public) = keypair()?;
-        let limits = json!({"tcp_buffer_size":32768, "tcp_buffer_max_size":1048576, "tcp_memory_bytes":33554432, "max_tcp_connections":80, "max_udp_queued_bytes":8388608});
-        let peer = json!([{
-            "address":format!("127.0.0.1:{peer_port}"),
-            "protocol":{"type":"wireguard", "wireguard_name":"offline-peer", "private_key":peer_key,
-                "addresses":["10.77.0.1/32"], "mtu":1420, "resource_limits":limits,
-                "peers":[{"public_key":client_public,"allowed_ips":["10.77.0.2/32"]}]},
-            // The peer maps every inner IPv4 target to loopback. This also makes a
-            // client-side private-address policy regression observable by a local trap.
-            "rules":[{"masks":"0.0.0.0/0","action":"allow","override_address":"127.0.0.1:0"}]
-        }]);
-        let proxy = json!([
-            {"global_settings":{"max_connections":80,"default_dns":{"servers":"wg-dns"}}},
-            {"dns_group":"wg-dns", "dns_servers":[
-                {"url":format!("udp://9.9.9.9:{dns1}"),"client_chain":"wg","ip_strategy":"ipv4_only","timeout_secs":2},
-                {"url":format!("udp://9.9.9.9:{dns2}"),"client_chain":"wg","ip_strategy":"ipv4_only","timeout_secs":2}
-            ]},
-            {"client_group":"wg", "client_chains":[{"address":format!("127.0.0.1:{peer_port}"),
-                "protocol":{"type":"wireguard","private_key":client_key,"public_key":peer_public,
-                    "addresses":["10.77.0.2/32"],"allowed_ips":["0.0.0.0/0"],"mtu":1280,"resource_limits":limits}}]},
-            {"address":format!("127.0.0.1:{ws_port}"),"protocol":ws_protocol(),"dns":{"servers":"wg-dns"},"rules":policy()}
-        ]);
-        drop(peer_reservation);
-        let mut peer = Process::start(peer)?;
-        drop(ws_reservation);
-        let mut proxy = Process::start(proxy)?;
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                peer.ensure_running()?; proxy.ensure_running()?;
-                if TcpStream::connect((Ipv4Addr::LOCALHOST, ws_port)).await.is_ok() { return Ok::<_,io::Error>(()); }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-        }).await??;
+        let (mut proxy, mut peer, ws_port) = start_pair(dns1, dns2).await?;
 
         for password in [OWNER, SECOND_OWNER] {
             let (mut writer, mut reader) = websocket(ws_port, PATH).await?;

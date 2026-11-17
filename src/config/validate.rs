@@ -173,6 +173,18 @@ fn validate_minimal_stream_protocol(protocol: &ServerProxyConfig) -> std::io::Re
 }
 
 #[cfg(feature = "relay-minimal")]
+fn minimal_chain_requires_wireguard(chain: &ResolvedClientChain) -> bool {
+    match chain.hops.iter().next() {
+        Some(ResolvedClientHop::Single(client)) => client.protocol.is_wireguard(),
+        Some(ResolvedClientHop::Choice(choice)) => {
+            !choice.members.is_empty()
+                && choice.members.iter().all(minimal_chain_requires_wireguard)
+        }
+        None => false,
+    }
+}
+
+#[cfg(feature = "relay-minimal")]
 fn validate_minimal_ingress_routes(
     rules: &NoneOrSome<ResolvedRuleConfig>,
     egress: super::RelayEgress,
@@ -181,7 +193,7 @@ fn validate_minimal_ingress_routes(
         if let ResolvedRuleActionConfig::Allow { client_chains, .. } = &rule.action
             && (client_chains.is_empty()
                 || client_chains.iter().any(|chain| match egress {
-                    super::RelayEgress::Wireguard => !chain_uses_wireguard(chain),
+                    super::RelayEgress::Wireguard => !minimal_chain_requires_wireguard(chain),
                     super::RelayEgress::Direct => !super::composition::direct_only(&chain.hops),
                 }))
         {
@@ -195,8 +207,127 @@ fn validate_minimal_ingress_routes(
 }
 
 #[cfg(feature = "relay-minimal")]
+fn minimal_hostname_outcomes(predicate: &crate::rules::Predicate) -> (bool, bool) {
+    use crate::rules::Kind;
+    // Conservative (never Match, never Miss) bounds for a supplied hostname
+    // without an IP. In particular, no-resolve IP rules remain Unknown under
+    // NOT; treating them as false would misclassify pure-IP forwarding.
+    match &predicate.kind {
+        Kind::Constant(value) => (!value, *value),
+        Kind::Ips(..) => (true, true),
+        Kind::Any(children) => children.iter().fold((true, false), |(a, b), child| {
+            let (never_match, never_miss) = minimal_hostname_outcomes(child);
+            (a && never_match, b || never_miss)
+        }),
+        Kind::All(children) => children.iter().fold((false, true), |(a, b), child| {
+            let (never_match, never_miss) = minimal_hostname_outcomes(child);
+            (a || never_match, b && never_miss)
+        }),
+        Kind::Not(child) => {
+            let (never_match, never_miss) = minimal_hostname_outcomes(child);
+            (never_miss, never_match)
+        }
+        Kind::ByPort(children) => (
+            children.iter().all(|(_, p)| minimal_hostname_outcomes(p).0),
+            false,
+        ),
+        _ => (false, false),
+    }
+}
+
+#[cfg(feature = "relay-minimal")]
+fn minimal_predicate_may_resolve(predicate: &crate::rules::Predicate) -> bool {
+    use crate::rules::Kind;
+    match &predicate.kind {
+        Kind::Ips(_, no_resolve) => !no_resolve,
+        Kind::Any(children) | Kind::All(children) => {
+            children.iter().any(|p| minimal_predicate_may_resolve(p))
+        }
+        Kind::Not(child) => minimal_predicate_may_resolve(child),
+        Kind::ByPort(children) => {
+            children.iter().any(|(_, p)| minimal_predicate_may_resolve(p))
+        }
+        _ => false,
+    }
+}
+
+#[cfg(feature = "relay-minimal")]
+fn minimal_rules_may_use_dns(rules: &NoneOrSome<ResolvedRuleConfig>) -> bool {
+    for rule in rules.iter() {
+        let predicate = rule.criteria.compiled.as_ref().expect("rules are compiled");
+        if matches!(predicate.kind, crate::rules::Kind::Constant(false)) {
+            continue;
+        }
+        if !rule.criteria.no_resolve && minimal_predicate_may_resolve(predicate) {
+            return true;
+        }
+        let may_resolve_target = match &rule.action {
+            ResolvedRuleActionConfig::Allow { override_address, .. } => {
+                override_address
+                    .as_ref()
+                    .is_some_and(|address| address.address().hostname().is_some())
+                    || (override_address.is_none() && !minimal_hostname_outcomes(predicate).0)
+            }
+            ResolvedRuleActionConfig::Block => false,
+        };
+        if may_resolve_target {
+            return true;
+        }
+        // An explicit unconditional maintenance rejection (or literal override)
+        // makes later rules unreachable for both hostname and IP destinations.
+        if matches!(predicate.kind, crate::rules::Kind::Constant(true)) {
+            break;
+        }
+    }
+    false
+}
+
+#[cfg(feature = "relay-minimal")]
+fn validate_minimal_ingress_dns(
+    server: &ResolvedServerConfig,
+    groups: &[ExpandedDnsGroup],
+) -> std::io::Result<()> {
+    let may_use_dns = match &server.protocol {
+        ResolvedServerProxyConfig::Websocket { targets } => targets.iter().any(|target| {
+            minimal_rules_may_use_dns(if target.override_rules.is_empty() {
+                &server.rules
+            } else {
+                &target.override_rules
+            })
+        }),
+        _ => minimal_rules_may_use_dns(&server.rules),
+    };
+    if !may_use_dns {
+        return Ok(());
+    }
+    let group = server
+        .dns
+        .as_ref()
+        .and_then(ResolvedDnsConfig::resolved_group)
+        .and_then(|name| groups.iter().find(|group| group.name == name));
+    if group.is_none_or(|group| {
+        group.use_default_resolver
+            || group.specs.is_empty()
+            || group.specs.iter().any(|spec| {
+                spec.url == "system"
+                    || spec.client_chains.is_empty()
+                    || spec
+                        .client_chains
+                        .iter()
+                        .any(|chain| !minimal_chain_requires_wireguard(chain))
+            })
+    }) {
+        return Err(minimal_unsupported(
+            "Trojan ingress DNS without exclusively WireGuard upstream routes",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "relay-minimal")]
 fn validate_minimal_resolved_routes(
     configs: &[ResolvedConfig],
+    groups: &[ExpandedDnsGroup],
     egress: super::RelayEgress,
 ) -> std::io::Result<()> {
     for config in configs {
@@ -214,6 +345,9 @@ fn validate_minimal_resolved_routes(
             for target in targets.iter() {
                 validate_minimal_ingress_routes(&target.override_rules, egress)?;
             }
+        }
+        if egress == super::RelayEgress::Wireguard {
+            validate_minimal_ingress_dns(server, groups)?;
         }
     }
     Ok(())
@@ -635,7 +769,7 @@ pub(super) fn create_server_configs_with_memory(
         result.push(ResolvedConfig::TunServer(config));
     }
     #[cfg(feature = "relay-minimal")]
-    validate_minimal_resolved_routes(&result, relay_egress)?;
+    validate_minimal_resolved_routes(&result, &final_dns_groups, relay_egress)?;
     crate::desktop::validate_config(&result)?;
     if result
         .iter()
@@ -3043,6 +3177,9 @@ mod default_dns_tests;
 
 #[cfg(test)]
 mod hosts_tests;
+
+#[cfg(all(test, feature = "relay-minimal"))]
+mod minimal_dns_tests;
 
 #[cfg(all(test, feature = "relay-minimal"))]
 mod minimal_tests {

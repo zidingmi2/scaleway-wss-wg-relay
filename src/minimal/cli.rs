@@ -12,10 +12,7 @@ const MAX_CONFIG: usize = 1024 * 1024;
 pub fn main() {
     if let Err(error) = run() {
         // Configuration errors may contain secret values. Print only the error kind.
-        eprintln!(
-            "relay failed ({:?}); inspect configuration locally",
-            error.kind()
-        );
+        eprintln!("relay failed ({:?})", error.kind());
         std::process::exit(1);
     }
 }
@@ -157,21 +154,55 @@ async fn serve(mut validated: ValidatedConfigs, logs: Arc<RelayLogState>) -> io:
             );
         }
     }));
-    #[cfg(unix)]
-    {
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        tokio::select! {_=tokio::signal::ctrl_c()=>{},_=term.recv()=>{}}
+    let result = wait_for_shutdown(
+        async {
+            #[cfg(unix)]
+            {
+                let mut term =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+                tokio::select! {
+                    result = tokio::signal::ctrl_c() => result,
+                    _ = term.recv() => Ok(()),
+                }
+            }
+            #[cfg(not(unix))]
+            tokio::signal::ctrl_c().await
+        },
+        running.failure(),
+    )
+    .await;
+    finish_shutdown(result, async {
+        for task in &tasks {
+            task.abort();
+        }
+        for task in tasks {
+            let _ = task.await;
+        }
+        running.stop().await;
+    })
+    .await
+}
+
+async fn wait_for_shutdown(
+    shutdown: impl std::future::Future<Output = io::Result<()>>,
+    failure: impl std::future::Future<Output = io::Error>,
+) -> io::Result<()> {
+    tokio::select! {
+        biased;
+        result = shutdown => result,
+        error = failure => Err(error),
     }
-    #[cfg(not(unix))]
-    tokio::signal::ctrl_c().await?;
-    for task in &tasks {
-        task.abort();
-    }
-    for task in tasks {
-        let _ = task.await;
-    }
-    running.stop().await;
-    Ok(())
+}
+
+async fn finish_shutdown(
+    result: io::Result<()>,
+    cleanup: impl std::future::Future<Output = ()>,
+) -> io::Result<()> {
+    let cleanup = tokio::time::timeout(crate::util::SHUTDOWN_TIMEOUT, cleanup).await;
+    // Preserve the data-plane failure even if cleanup also times out. main()
+    // turns this error into a nonzero exit so the platform can replace us.
+    result?;
+    cleanup.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "relay shutdown timed out"))
 }
 
 /// The relay never formats log arguments, which can contain destinations or credentials.
@@ -241,6 +272,29 @@ impl log::Log for RelayLogger {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn endpoint_failure_stays_an_error_even_when_cleanup_stalls() {
+        let result = wait_for_shutdown(std::future::pending(), async {
+            io::Error::new(io::ErrorKind::NotConnected, "offline endpoint stopped")
+        })
+        .await;
+        let error = finish_shutdown(result, std::future::pending())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotConnected);
+    }
+
+    #[tokio::test]
+    async fn requested_shutdown_finishes_successfully() {
+        let result = wait_for_shutdown(async { Ok(()) }, std::future::pending()).await;
+        let cleaned = std::cell::Cell::new(false);
+        finish_shutdown(result, async { cleaned.set(true) })
+            .await
+            .unwrap();
+        assert!(cleaned.get());
+    }
+
     #[test]
     fn logging_never_formats_secret_arguments() {
         struct Secret;

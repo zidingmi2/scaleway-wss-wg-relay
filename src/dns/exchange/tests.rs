@@ -12,6 +12,7 @@ fn endpoint_pairing_requires_equal_ip_port_and_bind_address() {
         ip,
         config,
         connection: Mutex::new(None),
+        tcp_preference: Default::default(),
     };
     let mut udp = upstream("192.0.2.1".parse().unwrap(), ConnectionConfig::udp());
     let mut tcp = upstream(udp.ip, ConnectionConfig::tcp());
@@ -373,6 +374,403 @@ async fn tcp_companion_falls_back_when_udp_is_silent() {
     }
 }
 
+#[cfg(feature = "relay-minimal")]
+fn paired_exchange(address: std::net::SocketAddr, timeout: Duration) -> RawDnsExchange {
+    let mut raw = exchange(address, false);
+    raw.context.options.timeout = timeout;
+    let mut config = ConnectionConfig::tcp();
+    config.port = address.port();
+    raw.upstreams.push(Upstream {
+        server_index: 0,
+        ip: address.ip(),
+        config,
+        connection: Mutex::new(None),
+        tcp_preference: Default::default(),
+    });
+    raw
+}
+
+#[cfg(feature = "relay-minimal")]
+fn distinct_request(name: &str) -> Vec<u8> {
+    let mut query = request();
+    query.queries[0].name = Name::from_ascii(name).unwrap();
+    query.to_vec().unwrap()
+}
+
+#[tokio::test]
+#[cfg(feature = "relay-minimal")]
+async fn tcp_preference_reuses_working_companion_and_expires_without_renewal() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (tcp, udp) = crate::dns::bind_tcp_and_udp().await;
+    let raw = paired_exchange(udp.local_addr().unwrap(), Duration::from_millis(300));
+    let udp_count = Arc::new(AtomicUsize::new(0));
+    let observed_udp = udp_count.clone();
+    let _udp = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+        let mut bytes = [0; 2048];
+        loop {
+            udp.recv_from(&mut bytes).await.unwrap();
+            observed_udp.fetch_add(1, Ordering::SeqCst);
+        }
+    }));
+    let tcp_count = Arc::new(AtomicUsize::new(0));
+    let observed_tcp = tcp_count.clone();
+    let _tcp = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+        let (mut stream, _) = tcp.accept().await.unwrap();
+        for _ in 0..3 {
+            let answer = read_tcp(&mut stream).await.into_response();
+            observed_tcp.fetch_add(1, Ordering::SeqCst);
+            write_tcp(&mut stream, answer).await;
+        }
+    }));
+
+    let start = tokio::time::Instant::now();
+    raw.exchange(distinct_request("learn.example."))
+        .await
+        .unwrap();
+    assert!(start.elapsed() >= Duration::from_millis(170));
+    assert_eq!(udp_count.load(Ordering::SeqCst), 1);
+    assert_eq!(tcp_count.load(Ordering::SeqCst), 1);
+
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(29)).await;
+    tokio::time::resume();
+    let start = tokio::time::Instant::now();
+    raw.exchange(distinct_request("preferred.example."))
+        .await
+        .unwrap();
+    assert!(start.elapsed() < Duration::from_millis(150));
+    assert_eq!(udp_count.load(Ordering::SeqCst), 1);
+    assert_eq!(tcp_count.load(Ordering::SeqCst), 2);
+
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(2)).await;
+    tokio::time::resume();
+    raw.exchange(distinct_request("expired.example."))
+        .await
+        .unwrap();
+    assert_eq!(udp_count.load(Ordering::SeqCst), 2);
+    assert_eq!(tcp_count.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+#[cfg(feature = "relay-minimal")]
+async fn preferred_tcp_failure_gives_udp_the_remaining_caller_deadline() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // A peer may silently stop responding, close its TCP connection, or send a
+    // malformed DNS answer. None may strand healthy UDP behind a stale hint.
+    for failure in ["silent", "closed", "mismatched", "truncated", "servfail", "refused"] {
+        let (tcp, udp) = crate::dns::bind_tcp_and_udp().await;
+        let raw = paired_exchange(udp.local_addr().unwrap(), Duration::from_millis(500));
+        let udp_count = Arc::new(AtomicUsize::new(0));
+        let observed_udp = udp_count.clone();
+        let _udp = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            let mut bytes = [0; 2048];
+            loop {
+                let (len, peer) = udp.recv_from(&mut bytes).await.unwrap();
+                if observed_udp.fetch_add(1, Ordering::SeqCst) != 0 {
+                    let answer = Message::from_vec(&bytes[..len]).unwrap().into_response();
+                    udp.send_to(&answer.to_vec().unwrap(), peer).await.unwrap();
+                }
+            }
+        }));
+        let tcp_count = Arc::new(AtomicUsize::new(0));
+        let observed_tcp = tcp_count.clone();
+        let _tcp = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            let (mut stream, _) = tcp.accept().await.unwrap();
+            let answer = read_tcp(&mut stream).await.into_response();
+            observed_tcp.fetch_add(1, Ordering::SeqCst);
+            write_tcp(&mut stream, answer).await;
+            let mut answer = read_tcp(&mut stream).await.into_response();
+            observed_tcp.fetch_add(1, Ordering::SeqCst);
+            match failure {
+                "closed" => return, // Also drop the listener, rejecting reconnects.
+                "mismatched" => {
+                    answer.queries[0].query_type = RecordType::MX;
+                    write_tcp(&mut stream, answer).await;
+                }
+                "truncated" | "servfail" | "refused" => {
+                    answer.metadata.truncation = failure == "truncated";
+                    answer.metadata.response_code = match failure {
+                        "servfail" => ResponseCode::ServFail,
+                        "refused" => ResponseCode::Refused,
+                        _ => ResponseCode::NoError,
+                    };
+                    write_tcp(&mut stream, answer).await;
+                }
+                _ => {}
+            }
+            std::future::pending::<()>().await;
+        }));
+        raw.exchange(distinct_request("learn.example."))
+            .await
+            .unwrap();
+        assert_eq!(udp_count.load(Ordering::SeqCst), 1);
+        assert_eq!(tcp_count.load(Ordering::SeqCst), 1);
+
+        let start = tokio::time::Instant::now();
+        let response = raw
+            .exchange_with_deadline(
+                distinct_request("recover.example."),
+                start + Duration::from_millis(150),
+            )
+            .await
+            .unwrap();
+        let response = Message::from_vec(&response).unwrap();
+        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+        assert!(!response.metadata.truncation);
+        assert!(start.elapsed() < Duration::from_millis(150));
+        assert_eq!(udp_count.load(Ordering::SeqCst), 2, "{failure}");
+        assert_eq!(tcp_count.load(Ordering::SeqCst), 2, "{failure}");
+
+        raw.exchange(distinct_request("udp-restored.example."))
+            .await
+            .unwrap();
+        assert_eq!(udp_count.load(Ordering::SeqCst), 3, "{failure}");
+        assert_eq!(tcp_count.load(Ordering::SeqCst), 2, "{failure}");
+    }
+}
+
+#[tokio::test]
+#[cfg(feature = "relay-minimal")]
+async fn udp_negative_and_truncation_do_not_teach_tcp_preference() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    for truncated in [false, true] {
+        let (tcp, udp) = crate::dns::bind_tcp_and_udp().await;
+        let raw = paired_exchange(udp.local_addr().unwrap(), Duration::from_millis(300));
+        let udp_count = Arc::new(AtomicUsize::new(0));
+        let observed_udp = udp_count.clone();
+        let _udp = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            let mut bytes = [0; 2048];
+            for _ in 0..2 {
+                let (len, peer) = udp.recv_from(&mut bytes).await.unwrap();
+                observed_udp.fetch_add(1, Ordering::SeqCst);
+                let mut answer = Message::from_vec(&bytes[..len]).unwrap().into_response();
+                answer.metadata.truncation = truncated;
+                if !truncated {
+                    answer.metadata.response_code = ResponseCode::NXDomain;
+                }
+                udp.send_to(&answer.to_vec().unwrap(), peer).await.unwrap();
+            }
+        }));
+        let tcp_count = Arc::new(AtomicUsize::new(0));
+        let observed_tcp = tcp_count.clone();
+        let _tcp = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            let (mut stream, _) = tcp.accept().await.unwrap();
+            for _ in 0..2 {
+                let answer = read_tcp(&mut stream).await.into_response();
+                observed_tcp.fetch_add(1, Ordering::SeqCst);
+                write_tcp(&mut stream, answer).await;
+            }
+        }));
+        for name in ["first.example.", "second.example."] {
+            let answer = raw.exchange(distinct_request(name)).await.unwrap();
+            let answer = Message::from_vec(&answer).unwrap();
+            assert!(!answer.metadata.truncation);
+            assert_eq!(
+                answer.metadata.response_code,
+                if truncated {
+                    ResponseCode::NoError
+                } else {
+                    ResponseCode::NXDomain
+                }
+            );
+        }
+        assert_eq!(udp_count.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            tcp_count.load(Ordering::SeqCst),
+            if truncated { 2 } else { 0 }
+        );
+    }
+}
+
+#[tokio::test]
+#[cfg(feature = "relay-minimal")]
+async fn slow_tcp_after_udp_truncation_does_not_teach_tcp_preference() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (tcp, udp) = crate::dns::bind_tcp_and_udp().await;
+    let raw = paired_exchange(udp.local_addr().unwrap(), Duration::from_millis(200));
+    let udp_count = Arc::new(AtomicUsize::new(0));
+    let observed_udp = udp_count.clone();
+    let _udp = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+        let mut bytes = [0; 2048];
+        for _ in 0..2 {
+            let (len, peer) = udp.recv_from(&mut bytes).await.unwrap();
+            observed_udp.fetch_add(1, Ordering::SeqCst);
+            let mut answer = Message::from_vec(&bytes[..len]).unwrap().into_response();
+            answer.metadata.truncation = true;
+            udp.send_to(&answer.to_vec().unwrap(), peer).await.unwrap();
+        }
+    }));
+    let tcp_count = Arc::new(AtomicUsize::new(0));
+    let observed_tcp = tcp_count.clone();
+    let _tcp = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+        let (mut stream, _) = tcp.accept().await.unwrap();
+        for _ in 0..2 {
+            // Keep the existing truncation retry pending until its enclosing
+            // UDP budget expires; answer only the later transport fallback.
+            read_tcp(&mut stream).await;
+            observed_tcp.fetch_add(1, Ordering::SeqCst);
+            let answer = read_tcp(&mut stream).await.into_response();
+            observed_tcp.fetch_add(1, Ordering::SeqCst);
+            write_tcp(&mut stream, answer).await;
+        }
+    }));
+    for name in ["first.example.", "second.example."] {
+        let answer = raw.exchange(distinct_request(name)).await.unwrap();
+        assert!(!Message::from_vec(&answer).unwrap().metadata.truncation);
+    }
+    assert_eq!(udp_count.load(Ordering::SeqCst), 2);
+    assert_eq!(tcp_count.load(Ordering::SeqCst), 4);
+}
+
+#[tokio::test]
+#[cfg(feature = "relay-minimal")]
+async fn preferred_tcp_partial_survives_udp_timeout_without_repeating_tcp() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    for truncated in [false, true] {
+        let (tcp, udp) = crate::dns::bind_tcp_and_udp().await;
+        let raw = paired_exchange(udp.local_addr().unwrap(), Duration::from_millis(300));
+        let udp_count = Arc::new(AtomicUsize::new(0));
+        let observed_udp = udp_count.clone();
+        let _udp = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            let mut bytes = [0; 2048];
+            loop {
+                udp.recv_from(&mut bytes).await.unwrap();
+                observed_udp.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+        let tcp_count = Arc::new(AtomicUsize::new(0));
+        let observed_tcp = tcp_count.clone();
+        let _tcp = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+            let (mut stream, _) = tcp.accept().await.unwrap();
+            for index in 0..2 {
+                let mut answer = read_tcp(&mut stream).await.into_response();
+                observed_tcp.fetch_add(1, Ordering::SeqCst);
+                if index == 1 {
+                    answer.metadata.truncation = truncated;
+                    if !truncated {
+                        answer.metadata.response_code = ResponseCode::ServFail;
+                    }
+                }
+                write_tcp(&mut stream, answer).await;
+            }
+            std::future::pending::<()>().await;
+        }));
+        raw.exchange(distinct_request("learn.example."))
+            .await
+            .unwrap();
+        let start = tokio::time::Instant::now();
+        let response = raw
+            .exchange_with_deadline(
+                distinct_request("partial.example."),
+                start + Duration::from_millis(150),
+            )
+            .await
+            .unwrap();
+        let response = Message::from_vec(&response).unwrap();
+        assert_eq!(response.metadata.truncation, truncated);
+        assert_eq!(
+            response.metadata.response_code,
+            if truncated {
+                ResponseCode::NoError
+            } else {
+                ResponseCode::ServFail
+            }
+        );
+        assert!(start.elapsed() < Duration::from_millis(250));
+        assert_eq!(udp_count.load(Ordering::SeqCst), 2);
+        assert_eq!(tcp_count.load(Ordering::SeqCst), 2);
+    }
+}
+
+#[tokio::test]
+#[cfg(feature = "relay-minimal")]
+async fn preferred_tcp_does_not_suppress_other_endpoint_udp() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let (tcp, udp) = crate::dns::bind_tcp_and_udp().await;
+    let mut raw = paired_exchange(udp.local_addr().unwrap(), Duration::from_millis(500));
+    raw.context.options.num_concurrent_reqs = 2;
+    let first_udp_count = Arc::new(AtomicUsize::new(0));
+    let observed_first_udp = first_udp_count.clone();
+    let _udp = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+        let mut bytes = [0; 2048];
+        loop {
+            udp.recv_from(&mut bytes).await.unwrap();
+            observed_first_udp.fetch_add(1, Ordering::SeqCst);
+        }
+    }));
+    let (tcp_waiting, wait_for_tcp) = tokio::sync::oneshot::channel();
+    let tcp_count = Arc::new(AtomicUsize::new(0));
+    let observed_tcp = tcp_count.clone();
+    let _tcp = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+        let (mut stream, _) = tcp.accept().await.unwrap();
+        let answer = read_tcp(&mut stream).await.into_response();
+        observed_tcp.fetch_add(1, Ordering::SeqCst);
+        write_tcp(&mut stream, answer).await;
+        read_tcp(&mut stream).await;
+        observed_tcp.fetch_add(1, Ordering::SeqCst);
+        tcp_waiting.send(()).unwrap();
+        std::future::pending::<()>().await;
+    }));
+    raw.exchange(distinct_request("learn.example."))
+        .await
+        .unwrap();
+
+    let healthy = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let address = healthy.local_addr().unwrap();
+    let mut config = ConnectionConfig::udp();
+    config.port = address.port();
+    raw.upstreams.push(Upstream {
+        server_index: 1,
+        ip: address.ip(),
+        config,
+        connection: Mutex::new(None),
+        tcp_preference: Default::default(),
+    });
+    let second_udp_count = Arc::new(AtomicUsize::new(0));
+    let observed_second_udp = second_udp_count.clone();
+    let _healthy = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+        let mut bytes = [0; 2048];
+        let (len, peer) = healthy.recv_from(&mut bytes).await.unwrap();
+        observed_second_udp.fetch_add(1, Ordering::SeqCst);
+        wait_for_tcp.await.unwrap();
+        let answer = Message::from_vec(&bytes[..len]).unwrap().into_response();
+        healthy.send_to(&answer.to_vec().unwrap(), peer).await.unwrap();
+    }));
+    tokio::time::timeout(
+        Duration::from_millis(150),
+        raw.exchange(distinct_request("parallel.example.")),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(first_udp_count.load(Ordering::SeqCst), 1);
+    assert_eq!(tcp_count.load(Ordering::SeqCst), 2);
+    assert_eq!(second_udp_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+#[cfg(feature = "relay-minimal")]
+async fn older_tcp_failure_cannot_clear_a_newer_working_preference() {
+    let raw = paired_exchange("127.0.0.1:53".parse().unwrap(), Duration::from_secs(1));
+    let upstream = &raw.upstreams[0];
+    let answer = request().into_response();
+    upstream.remember_tcp(&answer);
+    let old = upstream.preferred_tcp().unwrap();
+    upstream.remember_tcp(&answer);
+    let new = upstream.preferred_tcp().unwrap();
+    upstream.forget_tcp(old);
+    assert_eq!(upstream.preferred_tcp(), Some(new));
+    upstream.forget_tcp(new);
+    assert_eq!(upstream.preferred_tcp(), None);
+}
+
 #[tokio::test]
 async fn silent_first_server_does_not_starve_healthy_second_server() {
     for (system_pair, extra_silent) in [(false, false), (true, false), (true, true)] {
@@ -389,6 +787,7 @@ async fn silent_first_server_does_not_starve_healthy_second_server() {
                 ip: "127.0.0.1".parse().unwrap(),
                 config,
                 connection: Mutex::new(None),
+                tcp_preference: Default::default(),
             });
         }
         raw.upstreams[0].ip = "127.0.0.1".parse().unwrap();
@@ -400,6 +799,7 @@ async fn silent_first_server_does_not_starve_healthy_second_server() {
                 ip: "127.0.0.1".parse().unwrap(),
                 config,
                 connection: Mutex::new(None),
+                tcp_preference: Default::default(),
             });
         }
         let mut config = ConnectionConfig::udp();
@@ -409,6 +809,7 @@ async fn silent_first_server_does_not_starve_healthy_second_server() {
             ip: "127.0.0.1".parse().unwrap(),
             config,
             connection: Mutex::new(None),
+            tcp_preference: Default::default(),
         });
         let server = tokio::spawn(async move {
             let mut bytes = [0; 2048];
@@ -459,6 +860,7 @@ async fn udp_timeout_tcp_companion_setup_pending_reflects_fallback_state() {
             ip: address.ip(),
             config,
             connection: Mutex::new(Some(setup)),
+            tcp_preference: Default::default(),
         });
         let error = raw.exchange(request().to_vec().unwrap()).await.unwrap_err();
         if completed {
@@ -533,6 +935,7 @@ async fn assert_slow_setup_survives(concurrent: bool, fail_last: bool) {
             ip: address.ip(),
             config,
             connection: Mutex::new(None),
+            tcp_preference: Default::default(),
         });
     }
     let (stop_server, stopped) = tokio::sync::oneshot::channel();
@@ -775,6 +1178,7 @@ async fn udp_truncation_retries_the_same_configured_server_over_tcp() {
         ip: addr.ip(),
         config,
         connection: Mutex::new(None),
+        tcp_preference: Default::default(),
     });
     let server = tokio::spawn(async move {
         let mut bytes = [0; 2048];

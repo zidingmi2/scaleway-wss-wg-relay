@@ -5,7 +5,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use futures::task::{ArcWake, AtomicWaker, waker_ref};
+use futures::task::{ArcWake, waker_ref};
+
+use super::DuplexWake;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::websocket_handler::ClientHandshake;
@@ -23,23 +25,10 @@ enum State {
     Failed(io::ErrorKind, String),
 }
 
-#[derive(Default)]
-struct UpgradeWake {
-    reader: AtomicWaker,
-    writer: AtomicWaker,
-}
-
-impl ArcWake for UpgradeWake {
-    fn wake_by_ref(this: &Arc<Self>) {
-        this.reader.wake();
-        this.writer.wake();
-    }
-}
-
 pub(super) struct EarlyWebsocketStream {
     state: State,
     handshake: Arc<ClientHandshake>,
-    wake: Arc<UpgradeWake>,
+    wake: Arc<DuplexWake>,
     local: Option<SocketAddr>,
     peer: Option<SocketAddr>,
     flow: Option<Arc<FlowEntry>>,
@@ -99,7 +88,7 @@ impl EarlyWebsocketStream {
                 Ok(stream) => State::Open(stream),
                 Err(error) => State::Failed(error.kind(), error.to_string()),
             };
-            UpgradeWake::wake_by_ref(&self.wake);
+            DuplexWake::wake_by_ref(&self.wake);
         }
         match &mut self.state {
             State::Open(stream) => Poll::Ready(Ok(stream)),

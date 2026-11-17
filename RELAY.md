@@ -53,6 +53,12 @@ starting WireGuard. The environment-variable **name** is compatible with the
 existing deployment; its **payload format changes**. Old sing-box JSON must not
 be passed directly to this Rust program.
 
+WireGuard-mode Trojan listeners that can resolve application destinations
+must select a DNS group whose upstream routes all use WireGuard. The group can
+be inherited from global settings. An IP-only listener with no resolving
+rules and a block-all maintenance listener can omit application DNS. The
+WireGuard peer's own bootstrap DNS is configured separately.
+
 ## Resource model
 
 TCP begins with four 32 KiB buffers per flow, with a maximum of 4 MiB per buffer.
@@ -106,15 +112,25 @@ no pending datagrams, so abandoned DNS or UDP sessions cannot accumulate for
 the process lifetime on the 128 MB host; a reaped flow surfaces as the usual
 BrokenPipe on next use, and pooled DNS connections re-establish transparently.
 
-The WireGuard endpoint completes one peer handshake at startup before serving
-(capped at ten seconds, best effort), so a cold start or scale-up no longer
-pays the handshake round trip on the first user connection; the on-demand
-handshake remains the fallback when the warm-up fails.
+The minimal runtime reports flow counts and cumulative local packet drops
+once a minute per WireGuard endpoint. These counts cover the process's IP
+stack. Correlate changes with RSS, rejected connections and client timings
+when investigating stalls.
+
+The WireGuard endpoint starts a best-effort handshake in the background at
+startup, with a ten-second timeout per peer. An early connection may still
+overlap the handshake. If the device or packet-stack task exits unexpectedly,
+the minimal runtime closes its listeners and exits with an error so the host
+can replace the process. Packet loss or a missed handshake alone does not
+trigger a process restart.
 
 Relay chunk buffers are 32 KiB per direction and the WebSocket packing buffer
 is 64 KiB, so bulk flows emit one 32 KiB frame per write instead of 16 KiB
 frames, halving frame and downstream write syscall counts; interactive traffic
 still flushes as soon as both sides are pending.
+
+An incoming WebSocket Ping also drives a Pong flush while the application is
+idle, including when proactive WebSocket pings are disabled.
 
 DNS response caches survive idle-transport rebuilds for up to one hour
 (previously sixty seconds), and a UDP upstream whose exchange times out or
@@ -123,6 +139,12 @@ companion within the same slot before the overall deadline: over the tunnel a
 silently dropped UDP datagram is the normal failure mode, and no ICMP feedback
 ever reaches the container. Definitive DNS answers are never retried over TCP;
 they are handled by the exchange-level partial logic.
+
+In the minimal runtime, when a UDP exchange times out or fails and its TCP
+companion returns a complete, validated positive or negative answer, new
+queries to that endpoint prefer TCP for 30 seconds. Successful queries during
+that window do not extend it. A failed preferred TCP exchange leaves time
+for UDP within the request deadline. Both transports use the same DNS route.
 
 The expected host resource specification remains 100 mVCPU / 128 MB with
 minimum replicas 0 and maximum replicas 1. Language changes do not alter the
@@ -134,7 +156,9 @@ All fixtures use test keys and loopback or in-memory transports. No test may
 load the production WireGuard configuration or contact a public test target.
 The dedicated CI workflow runs test containers with `--network none`, and runs
 the compiled release binary's limited acceptance suite under a 128 MiB cap.
-There is no public speed test, benchmark or stress test.
+The capacity case holds 80 authenticated TCP flows open through a local
+WireGuard peer and verifies echoed data on every connection using the 4 MiB
+per-buffer and 48 MiB aggregate TCP limits.
 
 ## Future migration and rollback
 

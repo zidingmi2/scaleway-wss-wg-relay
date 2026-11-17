@@ -106,6 +106,66 @@ async fn start_prepared(prepared: &Prepared) -> Running {
     running
 }
 
+#[cfg(feature = "relay-minimal")]
+#[tokio::test]
+async fn minimal_supervisor_reports_failure_before_endpoint_cleanup_finishes() {
+    let failed = CancellationToken::new();
+    let notify = failed.clone();
+    let task = tokio::spawn(async move {
+        notify.cancel();
+        // A failed device may get stuck releasing its carrier or stack.
+        std::future::pending::<()>().await;
+    });
+    let mut running = Running {
+        endpoints: vec![EndpointRuntime {
+            cancel: CancellationToken::new(),
+            task,
+            failed,
+        }],
+    };
+    let error = tokio::time::timeout(Duration::from_secs(1), running.failure())
+        .await
+        .expect("failure must not wait for endpoint cleanup");
+    assert_eq!(error.kind(), stdio::ErrorKind::Other);
+    assert!(!running.endpoints[0].task.is_finished());
+    running.endpoints[0].task.abort();
+    running.stop().await;
+}
+
+#[cfg(feature = "relay-minimal")]
+#[tokio::test]
+async fn minimal_supervisor_detects_aborted_endpoint_before_its_first_poll() {
+    use serde_json::json;
+
+    let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let raw = json!([
+        config::client(peer.local_addr().unwrap().port()),
+        {"address":"127.0.0.1:0", "protocol":{"type":"trojan", "password":"offline"},
+         "dns":{"servers":[{"url":"udp://192.0.2.53", "client_chain":"wg"}]},
+         "rules":[{"masks":{"any_destination":true}, "action":"allow", "client_chain":"wg"}]}
+    ]);
+    let mut configs = validate(&serde_yaml::to_string(&raw).unwrap()).unwrap();
+    let prepared = Prepared::new(&mut configs).await.unwrap();
+    let mut running = start_prepared(&prepared).await;
+    assert_eq!(running.endpoints.len(), 1);
+    running.endpoints[0].task.abort();
+    tokio::time::timeout(Duration::from_secs(1), running.failure())
+        .await
+        .expect("aborting an unpolled endpoint must notify its supervisor");
+    running.stop().await;
+}
+
+#[cfg(feature = "relay-minimal")]
+#[tokio::test(start_paused = true)]
+async fn minimal_supervisor_without_wireguard_waits_for_requested_shutdown() {
+    let running = Running::default();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), running.failure())
+            .await
+            .is_err()
+    );
+}
+
 fn dns_answer(bytes: &[u8]) -> Vec<u8> {
     use hickory_resolver::proto::{
         op::{Message, MessageType},

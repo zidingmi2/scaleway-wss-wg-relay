@@ -302,6 +302,41 @@ async fn udp_receive_saturation_is_bounded_and_counted() {
 }
 
 #[tokio::test]
+async fn udp_idle_deadline_wakes_the_stack_and_pending_reader_without_traffic() {
+    use std::sync::atomic::Ordering;
+
+    let stack = stack(false, "10.77.0.2");
+    let mut stream = stack
+        .handle
+        .open_udp("10.77.0.1:53".parse().unwrap())
+        .await
+        .unwrap();
+    let control = stream.control.clone();
+    let mut reading = Box::pin(read_udp(&mut stream));
+    assert!(futures::poll!(&mut reading).is_pending());
+    // Leave a short real deadline so this exercises the stack thread's OS
+    // wait, without sleeping for the production 120-second idle timeout.
+    control.lock().last_activity = std::time::Instant::now()
+        - super::udp::UDP_FLOW_IDLE_TIMEOUT
+        + Duration::from_millis(300);
+    stack.handle.wake.notify();
+    let error = tokio::time::timeout(Duration::from_secs(2), reading)
+        .await
+        .expect("the UDP idle timer must wake the stack without another packet")
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    assert!(control.lock().closed);
+    // Closing wakes the reader before updating the published flow count.
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while stack.counts.outbound_udp.load(Ordering::Relaxed) != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn udp_admission_and_remote_tuple_isolation() {
     tokio::time::timeout(Duration::from_secs(3), async {
         let mut stack = stack(false, "10.77.0.2");

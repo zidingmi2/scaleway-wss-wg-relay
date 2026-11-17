@@ -339,6 +339,8 @@ impl Prepared {
 struct EndpointRuntime {
     cancel: CancellationToken,
     task: JoinHandle<()>,
+    #[cfg(feature = "relay-minimal")]
+    failed: CancellationToken,
 }
 impl Drop for EndpointRuntime {
     fn drop(&mut self) {
@@ -351,6 +353,22 @@ pub(crate) struct Running {
     endpoints: Vec<EndpointRuntime>,
 }
 impl Running {
+    /// An unexpected endpoint exit must replace the minimal relay process,
+    /// rather than leave a live listener permanently serving closed routes.
+    #[cfg(feature = "relay-minimal")]
+    pub async fn failure(&self) -> stdio::Error {
+        if !self.endpoints.is_empty() {
+            futures::future::select_all(
+                self.endpoints
+                    .iter()
+                    .map(|endpoint| Box::pin(endpoint.failed.cancelled())),
+            )
+            .await;
+            return stdio::Error::other("WireGuard service stopped unexpectedly");
+        }
+        std::future::pending().await
+    }
+
     pub async fn stop(&mut self) {
         for endpoint in &self.endpoints {
             endpoint.cancel.cancel();
@@ -482,7 +500,18 @@ impl PreparedEndpoint {
         let name = config.id.clone();
         let cancel = CancellationToken::new();
         let shutdown = cancel.clone();
+        #[cfg(feature = "relay-minimal")]
+        let failed = CancellationToken::new();
+        #[cfg(feature = "relay-minimal")]
+        let task_failed = failed.clone();
+        #[cfg(feature = "relay-minimal")]
+        let failure_on_exit = failed.clone().drop_guard();
         let task = tokio::spawn(async move {
+            // Covers a panic or cancellation of the endpoint task as well as
+            // explicit failures below. The supervisor has stopped waiting when
+            // an ordinary process shutdown cancels this endpoint.
+            #[cfg(feature = "relay-minimal")]
+            let _failure_on_exit = failure_on_exit;
             let mut tasks = JoinSet::new();
             let mut inbound_udp_count = None;
             if let Some((selector, resolver)) = inbound {
@@ -490,9 +519,8 @@ impl PreparedEndpoint {
                     &mut tasks, &mut stack, selector, resolver, limits,
                 ));
             }
-            // Warm the peer session before serving: a cold start or scale-up
-            // otherwise pays the full handshake round trip on the first user
-            // connection. Failure only falls back to the on-demand handshake.
+            // Start warming the peer alongside listener setup. Connections
+            // arriving first can still use the normal on-demand handshake.
             let warmup = async {
                 for peer in device.peers().await {
                     match tokio::time::timeout(
@@ -526,6 +554,19 @@ impl PreparedEndpoint {
                     _ = &mut stack.done => break true,
                     _ = tasks.join_next(), if !tasks.is_empty() => break true,
                     _ = report.tick() => {
+                        if cfg!(feature = "relay-minimal") {
+                            eprintln!(
+                                "relay wireguard tcp_flows={} outbound_udp_flows={} inbound_udp_destinations={} local_packet_drops={}",
+                                stack.counts.tcp.load(Ordering::Relaxed),
+                                stack.counts.outbound_udp.load(Ordering::Relaxed),
+                                inbound_udp_count.as_ref().map_or(0, |count| count.snapshot().active),
+                                stack.drops.load(Ordering::Relaxed),
+                            );
+                            continue;
+                        }
+                        if !log::log_enabled!(log::Level::Info) {
+                            continue;
+                        }
                         log::info!(
                             "WireGuard endpoint {name} tcp_flows={} outbound_udp_flows={} inbound_udp_destinations={} packet_drops={}",
                             stack.counts.tcp.load(Ordering::Relaxed),
@@ -548,6 +589,10 @@ impl PreparedEndpoint {
             *connector.active.lock() = None;
             if failed {
                 log::error!("WireGuard endpoint {name} stopped unexpectedly; routes remain closed");
+                // Notify before cleanup: a stuck device stop must not keep the
+                // minimal process alive with an unusable data plane.
+                #[cfg(feature = "relay-minimal")]
+                task_failed.cancel();
             }
             tasks.shutdown().await;
             device.stop().await;
@@ -559,7 +604,12 @@ impl PreparedEndpoint {
             );
             drop(stack);
         });
-        Ok(EndpointRuntime { cancel, task })
+        Ok(EndpointRuntime {
+            cancel,
+            task,
+            #[cfg(feature = "relay-minimal")]
+            failed,
+        })
     }
 }
 

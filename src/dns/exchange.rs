@@ -2,6 +2,7 @@ use std::fmt;
 use std::io;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures::future::{BoxFuture, Shared};
 use futures::{FutureExt, StreamExt};
@@ -27,6 +28,13 @@ struct Upstream {
     ip: IpAddr,
     config: ConnectionConfig,
     connection: Mutex<Option<Connection>>,
+    tcp_preference: parking_lot::Mutex<TcpPreference>,
+}
+
+#[derive(Default)]
+struct TcpPreference {
+    until: Option<tokio::time::Instant>,
+    generation: u64,
 }
 
 impl Upstream {
@@ -34,6 +42,45 @@ impl Upstream {
         self.ip == other.ip
             && self.config.port == other.config.port
             && self.config.bind_addr == other.config.bind_addr
+    }
+
+    fn preferred_tcp(&self) -> Option<u64> {
+        if !cfg!(feature = "relay-minimal") {
+            return None;
+        }
+        let mut preference = self.tcp_preference.lock();
+        if preference
+            .until
+            .is_some_and(|until| until > tokio::time::Instant::now())
+        {
+            Some(preference.generation)
+        } else {
+            preference.until = None;
+            None
+        }
+    }
+
+    fn remember_tcp(&self, answer: &Message) {
+        if !cfg!(feature = "relay-minimal")
+            || answer.metadata.truncation
+            || !matches!(
+                answer.metadata.response_code,
+                ResponseCode::NoError | ResponseCode::NXDomain
+            )
+        {
+            return;
+        }
+        let mut preference = self.tcp_preference.lock();
+        preference.generation = preference.generation.wrapping_add(1);
+        preference.until = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(30));
+    }
+
+    fn forget_tcp(&self, generation: u64) {
+        let mut preference = self.tcp_preference.lock();
+        // An older failed query must not erase a newer query's working transport.
+        if preference.generation == generation {
+            preference.until = None;
+        }
     }
 }
 
@@ -71,6 +118,7 @@ impl RawDnsExchange {
                         ip: server.ip,
                         config,
                         connection: Mutex::new(None),
+                        tcp_preference: Default::default(),
                     })
                 })
                 .collect(),
@@ -194,16 +242,19 @@ impl RawDnsExchange {
         let setups = parking_lot::Mutex::new(Vec::new());
         // A validated UDP partial must survive cancellation of its TCP retry.
         let partial = parking_lot::Mutex::new(None);
-        let result =
-            tokio::time::timeout(timeout, self.exchange_inner(&request, &setups, &partial))
-                .await
-                .unwrap_or_else(|_| {
-                    Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "DNS exchange deadline exceeded",
-                    ))
-                })
-                .or_else(|error| partial.into_inner().ok_or(error));
+        let deadline = tokio::time::Instant::now() + timeout;
+        let result = tokio::time::timeout_at(
+            deadline,
+            self.exchange_inner(&request, &setups, &partial, deadline),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "DNS exchange deadline exceeded",
+            ))
+        })
+        .or_else(|error| partial.into_inner().ok_or(error));
         if result.is_err()
             && setups
                 .lock()
@@ -224,6 +275,7 @@ impl RawDnsExchange {
         request: &Message,
         setups: &SetupWaits,
         partial: &PartialAnswer,
+        deadline: tokio::time::Instant,
     ) -> io::Result<Message> {
         let _permit = self.admission.acquire().await.map_err(io::Error::other)?;
         let mut error = net_error(NetError::NoConnections);
@@ -244,7 +296,14 @@ impl RawDnsExchange {
                 .collect();
             let concurrency = self.context.options.num_concurrent_reqs.max(1);
             let waves = upstreams.len().div_ceil(concurrency).max(1);
-            let slot_timeout = self.context.options.timeout / waves.min(u32::MAX as usize) as u32;
+            let attempt_timeout = if cfg!(feature = "relay-minimal") {
+                self.context.options.timeout.min(
+                    deadline.saturating_duration_since(tokio::time::Instant::now()),
+                )
+            } else {
+                self.context.options.timeout
+            };
+            let slot_timeout = attempt_timeout / waves.min(u32::MAX as usize) as u32;
             let jobs = futures::stream::iter(upstreams).map(|index| {
                 self.upstream_job(
                     &self.upstreams[index],
@@ -326,6 +385,7 @@ impl RawDnsExchange {
         partial: &'a PartialAnswer,
     ) -> BoxFuture<'a, io::Result<Message>> {
         Box::pin(async move {
+            let udp_truncated = AtomicBool::new(false);
             // A UDP upstream with a same-endpoint TCP companion reserves part of
             // its slot for that companion. A silently dropped UDP datagram is the
             // normal failure mode over the WireGuard tunnel, where no ICMP
@@ -339,7 +399,7 @@ impl RawDnsExchange {
             let Some(tcp) = companion else {
                 return tokio::time::timeout(
                     timeout,
-                    self.send(upstream, request.clone(), setups, partial),
+                    self.send(upstream, request.clone(), setups, partial, &udp_truncated),
                 )
                 .await
                 .unwrap_or_else(|_| {
@@ -353,41 +413,80 @@ impl RawDnsExchange {
             // slot the wave scheduler granted, whatever its absolute size.
             let udp_budget = timeout.mul_f64(0.6);
             let tcp_budget = timeout.saturating_sub(udp_budget);
+            if let Some(generation) = upstream.preferred_tcp() {
+                // Only a previously validated, same-route companion gets this
+                // head start. Do not renew the preference on TCP-only success:
+                // UDP gets another opportunity after the fixed short cooldown.
+                let deadline = tokio::time::Instant::now() + timeout;
+                let result = self
+                    .try_tcp_companion(tcp, request, setups, tcp_budget)
+                    .await;
+                if let Ok(answer) = result
+                    && check_answer(&answer, request).is_ok()
+                {
+                    if !answer.metadata.truncation
+                        && matches!(
+                            answer.metadata.response_code,
+                            ResponseCode::NoError | ResponseCode::NXDomain
+                        )
+                    {
+                        return Ok(answer);
+                    }
+                    // Preserve valid partial/negative DNS semantics while UDP
+                    // gets the rest of this slot to produce a complete answer.
+                    partial.lock().get_or_insert(answer);
+                }
+                upstream.forget_tcp(generation);
+                // A stale TCP preference never consumes UDP's whole slot,
+                // including when the caller supplied a shorter total deadline.
+                return tokio::time::timeout_at(
+                    deadline,
+                    // TCP has already had its chance; a truncated UDP reply
+                    // must not start a second attempt of that same companion.
+                    self.send_upstream(upstream, request.clone(), setups),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "DNS upstream deadline exceeded",
+                    ))
+                })
+                .and_then(|answer| {
+                    check_answer(&answer, request)?;
+                    Ok(answer)
+                });
+            }
             let udp_result = tokio::time::timeout(
                 udp_budget,
-                self.send(upstream, request.clone(), setups, partial),
+                self.send(upstream, request.clone(), setups, partial, &udp_truncated),
             )
             .await;
-            match udp_result {
-                Ok(Ok(answer)) => Ok(answer),
+            let udp_error = match udp_result {
+                Ok(Ok(answer)) => return Ok(answer),
                 Ok(Err(error)) => {
                     if !is_transport_failure(&error) {
                         return Err(error);
                     }
-                    if let Ok(answer) =
-                        self.try_tcp_companion(tcp, request, setups, tcp_budget).await
-                    {
-                        check_answer(&answer, request)?;
-                        return Ok(answer);
-                    }
-                    // The original UDP error keeps transport semantics that
-                    // upstream refresh and retry logic reason about.
-                    Err(error)
+                    error
                 }
-                Err(_udp_elapsed) => {
-                    let udp_error = io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "DNS upstream deadline exceeded",
-                    );
-                    if let Ok(answer) =
-                        self.try_tcp_companion(tcp, request, setups, tcp_budget).await
-                    {
-                        check_answer(&answer, request)?;
-                        return Ok(answer);
-                    }
-                    Err(udp_error)
+                Err(_udp_elapsed) => io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "DNS upstream deadline exceeded",
+                ),
+            };
+            if let Ok(answer) = self.try_tcp_companion(tcp, request, setups, tcp_budget).await {
+                check_answer(&answer, request)?;
+                // A UDP truncation followed by a stalled TCP retry can also
+                // exhaust the UDP budget. It is not evidence of broken UDP.
+                if !udp_truncated.load(Ordering::Relaxed) {
+                    upstream.remember_tcp(&answer);
                 }
+                return Ok(answer);
             }
+            // The original UDP error keeps transport semantics that upstream
+            // refresh and retry logic reason about.
+            Err(udp_error)
         })
     }
 
@@ -397,12 +496,14 @@ impl RawDnsExchange {
         message: Message,
         setups: &SetupWaits,
         partial: &PartialAnswer,
+        udp_truncated: &AtomicBool,
     ) -> io::Result<Message> {
         let answer = self
             .send_upstream(upstream, message.clone(), setups)
             .await?;
         check_answer(&answer, &message)?;
         if answer.metadata.truncation && matches!(upstream.config.protocol, ProtocolConfig::Udp) {
+            udp_truncated.store(true, Ordering::Relaxed);
             if let Some(tcp) = self.tcp_companion(upstream) {
                 partial.lock().get_or_insert_with(|| answer.clone());
                 let answer = self.send_upstream(tcp, message.clone(), setups).await?;

@@ -1,7 +1,11 @@
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::sync::Arc;
+use std::task::{Context, Poll, Waker};
 
 use futures::ready;
+use futures::task::waker_ref;
+
+use super::DuplexWake;
 use log::warn;
 use rand::Rng;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -37,6 +41,9 @@ pub struct WebsocketStream {
     ping_data: Box<[u8]>,
     ping_data_size: usize,
     pending_write_pong: bool,
+    flushing_pong: bool,
+    output_wake: Option<Arc<DuplexWake>>,
+    waiting_writer: Option<Waker>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -126,6 +133,9 @@ impl WebsocketStream {
             ping_data,
             ping_data_size: 0,
             pending_write_pong: false,
+            flushing_pong: false,
+            output_wake: None,
+            waiting_writer: None,
         }
     }
 
@@ -319,10 +329,6 @@ impl WebsocketStream {
                 }
             }
             OpCode::Pong => {
-                // Note that pongs might be delayed, and only written when there's data to write,
-                // because copy_bidirectional does not know we need a flush, and wouldn't call
-                // poll_write until new data arrives.
-
                 // We don't keep track if we're expecting a pong, because
                 // it's allowed for the other side to only respond to the latest
                 // ping, ie. we could send 5 pings and only 1 pong response arrives.
@@ -389,9 +395,6 @@ impl WebsocketStream {
 
         if self.read_frame_length == 0 {
             self.read_state = ReadState::Init;
-            // this previously tried to pack_write_pong_frame right away - but there's no
-            // point in doing it, because copy_bidirectional wouldn't know there's anything
-            // to flush unless poll_write or poll_write_ping is called anyway.
             self.pending_write_pong = true;
             return self.step_init(cx, buf);
         }
@@ -550,10 +553,36 @@ impl WebsocketStream {
         self.unprocessed_end_offset -= self.unprocessed_start_offset;
         self.unprocessed_start_offset = 0;
     }
-}
 
-impl AsyncRead for WebsocketStream {
-    fn poll_read(
+    // A Ping is handled even when the application never writes. Keep the
+    // flush obligation across partial writes, including buffered TLS transports.
+    fn poll_pong(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        if self.pending_write_pong {
+            if !self.pack_write_pong_frame() {
+                ready!(self.flush_output(cx))?;
+                assert!(self.pack_write_pong_frame());
+            }
+            self.pending_write_pong = false;
+            self.flushing_pong = true;
+        }
+        if self.flushing_pong {
+            ready!(self.flush_output(cx))?;
+            self.flushing_pong = false;
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    fn flush_output(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        if self.write_frame_end_offset > 0 {
+            self.do_write_frame(cx)?;
+            if self.write_frame_end_offset > 0 {
+                return Poll::Pending;
+            }
+        }
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_payload(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
@@ -631,37 +660,12 @@ impl AsyncRead for WebsocketStream {
             }
         }
     }
-}
 
-impl AsyncWrite for WebsocketStream {
-    fn poll_write(
-        self: Pin<&mut Self>,
+    fn write_payload(
+        &mut self,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        let this = self.get_mut();
-
-        if buf.is_empty() {
-            return Poll::Ready(Ok(0));
-        }
-
-        if this.pending_write_pong {
-            if this.pack_write_pong_frame() {
-                this.pending_write_pong = false;
-            } else {
-                // Write and try to make space in the write frame,
-                // then try again.
-                if let Err(e) = this.do_write_frame(cx) {
-                    return Poll::Ready(Err(e));
-                }
-                if this.pack_write_pong_frame() {
-                    this.pending_write_pong = false;
-                } else {
-                    return Poll::Pending;
-                }
-            }
-        }
-
         let mut written = 0;
         loop {
             let input = &buf[written..];
@@ -669,13 +673,13 @@ impl AsyncWrite for WebsocketStream {
                 break;
             }
 
-            written += this.pack_write_frame(input);
+            written += self.pack_write_frame(input);
 
-            if let Err(e) = this.do_write_frame(cx) {
+            if let Err(e) = self.do_write_frame(cx) {
                 return Poll::Ready(Err(e));
             }
 
-            if this.write_frame_end_offset > 0 {
+            if self.write_frame_end_offset > 0 {
                 // Not everything could be written.
                 break;
             }
@@ -688,28 +692,84 @@ impl AsyncWrite for WebsocketStream {
         }
     }
 
-    fn poll_flush(
-        self: Pin<&mut Self>,
+    fn with_writer<T>(
+        &mut self,
         cx: &mut Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-
-        if this.write_frame_end_offset > 0 {
-            this.do_write_frame(cx)?;
-            if this.write_frame_end_offset > 0 {
-                return Poll::Pending;
-            }
+        operation: impl FnOnce(&mut Self, &mut Context<'_>) -> Poll<std::io::Result<T>>,
+    ) -> Poll<std::io::Result<T>> {
+        if self.pending_write_pong || self.flushing_pong {
+            let wake = self.pong_wake();
+            wake.writer.register(cx.waker());
+            let waker = waker_ref(&wake);
+            let result = ready!(self.poll_pong(&mut Context::from_waker(&waker)));
+            wake.writer.take();
+            wake.reader.wake();
+            result?;
         }
-
-        Pin::new(&mut this.stream).poll_flush(cx)
+        // Normal writes go directly to the transport. Only a suspended writer
+        // needs to be remembered in case a reader later polls a Pong write.
+        let result = operation(self, cx);
+        self.waiting_writer = result.is_pending().then(|| cx.waker().clone());
+        result
     }
 
-    fn poll_shutdown(
+    fn pong_wake(&mut self) -> Arc<DuplexWake> {
+        let wake = self.output_wake.get_or_insert_with(Arc::default);
+        if let Some(writer) = self.waiting_writer.take() {
+            wake.writer.register(&writer);
+        }
+        wake.clone()
+    }
+}
+
+impl AsyncRead for WebsocketStream {
+    fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        ready!(self.as_mut().poll_flush(cx))?;
-        Pin::new(&mut self.stream).poll_shutdown(cx)
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let filled_before = buf.filled().len();
+        let read = self.as_mut().poll_payload(cx, buf);
+        if self.pending_write_pong || self.flushing_pong {
+            let wake = self.pong_wake();
+            wake.reader.register(cx.waker());
+            let waker = waker_ref(&wake);
+            if let Poll::Ready(result) = self.poll_pong(&mut Context::from_waker(&waker)) {
+                wake.reader.take();
+                wake.writer.wake();
+                if buf.filled().len() == filled_before {
+                    result?;
+                }
+            }
+        }
+        // A blocked output must not stall independent inbound payload.
+        read
+    }
+}
+
+impl AsyncWrite for WebsocketStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        self.get_mut().with_writer(cx, |stream, cx| {
+            stream.write_payload(cx, buf)
+        })
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        self.get_mut().with_writer(cx, Self::flush_output)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        self.get_mut().with_writer(cx, |stream, cx| {
+            ready!(stream.flush_output(cx))?;
+            Pin::new(&mut stream.stream).poll_shutdown(cx)
+        })
     }
 }
 
@@ -721,20 +781,9 @@ impl AsyncPing for WebsocketStream {
     fn poll_write_ping(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<bool>> {
         let this = self.get_mut();
 
-        if this.pending_write_pong {
-            if this.pack_write_pong_frame() {
-                this.pending_write_pong = false;
-                return Poll::Ready(Ok(true));
-            } else {
-                // If pack_write_pong_frame returns false, it means that there's not enough space
-                // for the pong frame at the moment - but that also means:
-                // 1) we have lots of data to write out
-                // 2) a future check of pending_write_pong will still result in a pong being
-                // written.
-                // This isn't a case where we are pending a write - so don't return Poll::Pending,
-                // simply return that no data has been written.
-                return Poll::Ready(Ok(false));
-            }
+        if this.pending_write_pong || this.flushing_pong {
+            // The caller follows a successful ping write with poll_flush.
+            return Poll::Ready(Ok(true));
         }
 
         // Don't bother writing a ping if we have other things to write.
@@ -883,6 +932,140 @@ mod mask_tests {
     }
 }
 
+#[cfg(test)]
+mod heartbeat_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::time::{Duration, timeout};
+
+    #[tokio::test]
+    async fn normal_writes_only_retain_a_waker_under_backpressure() {
+        let (io, mut peer) = tokio::io::duplex(2);
+        let mut stream =
+            WebsocketStream::new(Box::new(io), false, WebsocketPingType::Disabled, &[]);
+        stream.write_all(b"hello").await.unwrap();
+        assert!(stream.waiting_writer.is_none());
+
+        assert!(futures::poll!(Box::pin(stream.flush())).is_pending());
+        assert!(stream.waiting_writer.is_some());
+        let mut frame = [0; 7];
+        let (flushed, read) = tokio::join!(stream.flush(), peer.read_exact(&mut frame));
+        flushed.unwrap();
+        read.unwrap();
+        assert_eq!(&frame, b"\x82\x05hello");
+        assert!(stream.waiting_writer.is_none());
+        assert!(stream.output_wake.is_none());
+    }
+
+    #[tokio::test]
+    async fn blocked_read_and_write_halves_both_receive_output_readiness() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::{Wake, Waker};
+
+        #[derive(Default)]
+        struct Notified(AtomicBool);
+        impl Wake for Notified {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+
+        for read_first in [false, true] {
+            let (io, mut peer) = tokio::io::duplex(1);
+            let mut wire = [0; 16];
+            let n = pack_frame(9, true, b"p", &mut wire);
+            let mut stream =
+                WebsocketStream::new(Box::new(io), false, WebsocketPingType::Disabled, &wire[..n]);
+            // Fill the pipe and leave the rest of the data frame queued.
+            stream.write_all(b"queued").await.unwrap();
+            let (mut reader, mut writer) = tokio::io::split(stream);
+            let reader_woke = Arc::<Notified>::default();
+            let writer_woke = Arc::<Notified>::default();
+            let read_waker = Waker::from(reader_woke.clone());
+            let write_waker = Waker::from(writer_woke.clone());
+            let mut slot = [0; 1];
+            let mut read = || {
+                Pin::new(&mut reader)
+                    .poll_read(&mut Context::from_waker(&read_waker), &mut ReadBuf::new(&mut slot))
+                    .is_pending()
+            };
+            let mut write = || {
+                Pin::new(&mut writer).poll_flush(&mut Context::from_waker(&write_waker)).is_pending()
+            };
+            if read_first {
+                assert!(read() && write());
+            } else {
+                assert!(write() && read());
+            }
+            assert_eq!(peer.read_u8().await.unwrap(), 0x82);
+            assert!(reader_woke.0.load(Ordering::Relaxed));
+            assert!(writer_woke.0.load(Ordering::Relaxed));
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_reader_replies_to_ping_without_an_application_write() {
+        timeout(Duration::from_secs(2), async {
+            // A small duplex pipe forces the Pong to span multiple writes.
+            let (io, mut peer) = tokio::io::duplex(2);
+            let mut stream =
+                WebsocketStream::new(Box::new(io), false, WebsocketPingType::Disabled, &[]);
+            let mut wire = [0; 32];
+            let length = pack_frame(9, true, b"idle", &mut wire);
+            let read = stream.read_u8();
+            let exchange = async {
+                peer.write_all(&wire[..length]).await.unwrap();
+                let mut pong = [0; 6];
+                peer.read_exact(&mut pong).await.unwrap();
+                assert_eq!(&pong, b"\x8a\x04idle");
+                let length = pack_frame(2, true, b"x", &mut wire);
+                peer.write_all(&wire[..length]).await.unwrap();
+            };
+            let (byte, ()) = tokio::join!(read, exchange);
+            assert_eq!(byte.unwrap(), b'x');
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn backpressured_pong_preserves_reads_and_frame_order() {
+        timeout(Duration::from_secs(2), async {
+            let (io, mut peer) = tokio::io::duplex(4);
+            let mut stream =
+                WebsocketStream::new(Box::new(io), false, WebsocketPingType::Disabled, &[]);
+            stream.write_all(b"prior").await.unwrap();
+            let (mut reader, mut writer) = tokio::io::split(stream);
+            let mut ping = [0; 16];
+            let n = pack_frame(9, true, b"p", &mut ping);
+            let mut data = [0; 16];
+            let m = pack_frame(2, true, b"x", &mut data);
+            let send = async {
+                peer.write_all(&ping[..n]).await.unwrap();
+                peer.write_all(&data[..m]).await.unwrap();
+            };
+            let (received, ()) = tokio::join!(reader.read_u8(), send);
+            assert_eq!(received.unwrap(), b'x');
+            let mut next = [0; 16];
+            let length = pack_frame(2, true, b"y", &mut next);
+            let exchange = async {
+                let mut frames = [0; 17];
+                peer.read_exact(&mut frames).await.unwrap();
+                assert_eq!(&frames, b"\x82\x05prior\x8a\x01p\x82\x05after");
+                peer.write_all(&next[..length]).await.unwrap();
+            };
+            let write = async {
+                writer.write_all(b"after").await.unwrap();
+                writer.flush().await.unwrap();
+            };
+            let (received, (), ()) = tokio::join!(reader.read_u8(), write, exchange);
+            assert_eq!(received.unwrap(), b'y');
+        })
+        .await
+        .unwrap();
+    }
+}
+
 #[cfg(all(test, not(feature = "relay-minimal")))]
 mod tests {
     use super::*;
@@ -950,12 +1133,6 @@ mod tests {
                     }
                     assert_eq!(stream.read(&mut [0; 1]).await.unwrap(), 0);
 
-                    let wrote_pong =
-                        futures::future::poll_fn(|cx| Pin::new(&mut stream).poll_write_ping(cx))
-                            .await
-                            .unwrap();
-                    assert!(wrote_pong);
-                    stream.flush().await.unwrap();
                     let mut pong = vec![0; 2 + ping_payload.len()];
                     peer.read_exact(&mut pong).await.unwrap();
                     assert_eq!(&pong[..2], &[0x8a, ping_payload.len() as u8]);
@@ -1002,12 +1179,13 @@ mod tests {
                 if pong {
                     assert!(Pin::new(&mut tls).poll_read(&mut cx, &mut buf).is_pending());
                     assert!(buf.filled().is_empty());
+                } else {
+                    assert!(matches!(
+                        Pin::new(&mut tls).poll_write_ping(&mut cx),
+                        Poll::Ready(Ok(true))
+                    ));
+                    tls.flush().await.unwrap();
                 }
-                assert!(matches!(
-                    Pin::new(&mut tls).poll_write_ping(&mut cx),
-                    Poll::Ready(Ok(true))
-                ));
-                tls.flush().await.unwrap();
                 assert!(matches!(
                     Pin::new(&mut peer).poll_read(&mut cx, &mut buf),
                     Poll::Ready(Ok(()))
@@ -1137,12 +1315,6 @@ mod tests {
                 let mut received = Vec::new();
                 stream.read_to_end(&mut received).await.unwrap();
                 assert_eq!(received, b"data", "masked={masked}");
-                let wrote_pong =
-                    futures::future::poll_fn(|cx| Pin::new(&mut stream).poll_write_ping(cx))
-                        .await
-                        .unwrap();
-                assert!(wrote_pong, "masked={masked}");
-                stream.flush().await.unwrap();
                 let mut pong = vec![0; 2 + ping.len()];
                 peer.read_exact(&mut pong).await.unwrap();
                 assert_eq!(&pong[..2], &[0x8a, 125], "masked={masked}");

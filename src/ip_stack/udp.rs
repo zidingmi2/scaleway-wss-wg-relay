@@ -18,9 +18,10 @@ const FLOW_QUEUE_CAPACITY: usize = 8;
 /// Idle lifetime of an outbound UDP flow (one local-address five-tuple). The
 /// stack thread reaps flows after this long without a send or a receive, so
 /// abandoned DNS or UDP sessions cannot accumulate for the process lifetime on
-/// a 128 MB host. Pending datagrams and waiting wakers keep the flow alive
-/// until they drain; a reaped flow surfaces as BrokenPipe on the next handle
-/// use, matching the existing close semantics.
+/// a 128 MB host. Pending datagrams keep the flow alive until they drain;
+/// registered readers do not count as traffic and are woken on expiry. A
+/// reaped flow surfaces as BrokenPipe on the next handle use, matching the
+/// existing close semantics.
 pub(crate) const UDP_FLOW_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub(crate) struct Datagram {
@@ -73,14 +74,24 @@ impl UdpControl {
         if self.closed {
             return true;
         }
-        if self.incoming.is_empty()
-            && self.outgoing.is_empty()
-            && self.last_activity.elapsed() > UDP_FLOW_IDLE_TIMEOUT
-        {
+        if self.idle_delay(std::time::Instant::now()) == Some(Duration::ZERO) {
             self.close();
             return true;
         }
         false
+    }
+
+    /// Pending datagrams must drain before the idle timer can close a flow.
+    pub fn idle_delay(&self, now: std::time::Instant) -> Option<Duration> {
+        self.idle_deadline()
+            .map(|deadline| deadline.saturating_duration_since(now))
+    }
+
+    pub fn idle_deadline(&self) -> Option<std::time::Instant> {
+        if self.closed || !self.incoming.is_empty() || !self.outgoing.is_empty() {
+            return None;
+        }
+        Some(self.last_activity + UDP_FLOW_IDLE_TIMEOUT)
     }
 }
 
@@ -109,6 +120,14 @@ impl AsyncReadMessage for UdpConnection {
     ) -> Poll<io::Result<()>> {
         let mut control = self.control.lock();
         if let Some(datagram) = control.incoming.pop_front() {
+            let drained = control.incoming.is_empty();
+            drop(control);
+            if drained {
+                // Queued input suppresses the idle timer. Recompute its
+                // deadline when the final datagram leaves the queue, even if
+                // no later packet or connection command arrives.
+                self.wake.notify();
+            }
             if buf.remaining() < datagram.packet.len() {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -216,3 +235,85 @@ impl AsyncPing for UdpConnection {
     }
 }
 impl AsyncMessageStream for UdpConnection {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn control() -> UdpControl {
+        UdpControl {
+            local: "10.77.0.2:40000".parse().unwrap(),
+            remote: "10.77.0.1:53".parse().unwrap(),
+            incoming: Default::default(),
+            outgoing: Default::default(),
+            reader: None,
+            writer: None,
+            closed: false,
+            budget: Arc::new(Budget::new(Some(4096))),
+            last_activity: std::time::Instant::now(),
+        }
+    }
+
+    #[test]
+    fn idle_deadline_preserves_fresh_flows_and_pending_datagrams() {
+        let mut control = control();
+        let start = control.last_activity;
+        assert_eq!(control.idle_delay(start), Some(UDP_FLOW_IDLE_TIMEOUT));
+        assert_eq!(
+            control.idle_delay(start + UDP_FLOW_IDLE_TIMEOUT - Duration::from_nanos(1)),
+            Some(Duration::from_nanos(1))
+        );
+        assert_eq!(
+            control.idle_delay(start + UDP_FLOW_IDLE_TIMEOUT),
+            Some(Duration::ZERO)
+        );
+        assert!(!control.reap_if_expired());
+
+        control.last_activity = start - UDP_FLOW_IDLE_TIMEOUT - Duration::from_secs(1);
+        control.incoming.push_back(Datagram {
+            packet: PacketBuffer::copy_from_slice(b"pending reply"),
+        });
+        assert_eq!(control.idle_delay(start), None);
+        assert!(!control.reap_if_expired());
+        control.outgoing.append(&mut control.incoming);
+        assert_eq!(control.idle_delay(start), None);
+        assert!(!control.reap_if_expired());
+        control.outgoing.clear();
+        assert!(control.reap_if_expired());
+        assert!(control.closed);
+    }
+
+    #[test]
+    fn draining_last_reply_reschedules_idle_expiry_even_with_a_short_buffer() {
+        for short_buffer in [false, true] {
+            let mut control = control();
+            control.last_activity -= UDP_FLOW_IDLE_TIMEOUT + Duration::from_secs(1);
+            control.incoming.push_back(Datagram {
+                packet: PacketBuffer::copy_from_slice(b"reply"),
+            });
+            let (wake, wake_rx) = Wake::new().unwrap();
+            let mut stream = UdpConnection {
+                control: Arc::new(Mutex::new(control)),
+                wake,
+                mtu: 1280,
+                drops: Arc::default(),
+            };
+            assert!(!wake_rx.wait(-1, Some(Duration::ZERO)).unwrap());
+            let mut bytes = [0; 5];
+            let mut buf = ReadBuf::new(if short_buffer { &mut [] } else { &mut bytes });
+            let mut cx = Context::from_waker(Waker::noop());
+            let Poll::Ready(result) = Pin::new(&mut stream).poll_read_message(&mut cx, &mut buf)
+            else {
+                panic!("the queued datagram must be ready");
+            };
+            if short_buffer {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+            } else {
+                result.unwrap();
+                assert_eq!(buf.filled(), b"reply");
+            }
+            assert!(wake_rx.wait(-1, Some(Duration::ZERO)).unwrap());
+            assert!(stream.control.lock().reap_if_expired());
+        }
+    }
+}
